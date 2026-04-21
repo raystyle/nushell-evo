@@ -7,6 +7,9 @@ on:
       - '[0-9]+.[0-9]+.[0-9]+*'
       - '!*nightly*'
 
+permissions:
+  contents: write
+
 defaults:
   run:
     shell: bash
