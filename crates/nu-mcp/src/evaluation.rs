@@ -1,7 +1,7 @@
 use crate::history::History;
-use miette::{Diagnostic, SourceCode, SourceSpan};
+use miette::{Diagnostic, ReportHandler, SourceCode, SourceSpan};
 use nu_protocol::{
-    PipelineData, PipelineExecutionData, Signals, Span, Value,
+    PipelineData, PipelineExecutionData, ShellError, Signals, Span, Value,
     debugger::WithoutDebug,
     engine::{EngineState, Job, Jobs, Mail, Stack, StateWorkingSet, ThreadJob},
 };
@@ -14,8 +14,8 @@ use std::{
 use tokio::sync::{Mutex, oneshot};
 use tokio_util::sync::CancellationToken;
 
-const ERROR_LOG_ENV_VAR: &str = "NU_MCP_ERROR_LOG";
-const DEFAULT_ERROR_LOG_FILE: &str = "nu_mcp_error.jsonl";
+const ERROR_LOG_ENV_VAR: &str = "NU_MCP_LOG";
+const DEFAULT_ERROR_LOG_FILE: &str = "nu_evo.jsonl";
 
 const OUTPUT_LIMIT_ENV_VAR: &str = "NU_MCP_OUTPUT_LIMIT";
 const DEFAULT_OUTPUT_LIMIT: usize = 10 * 1024; // 10kb
@@ -197,53 +197,41 @@ fn classify_error(error_message: &str) -> &'static str {
     }
 }
 
-fn extract_short_error(error_message: &str) -> String {
-    // Try to extract the msg: field from NUON error text.
-    // The msg field may appear mid-line (e.g. "msg: \"File not found\", ...")
-    if let Some(idx) = error_message.find("msg:") {
-        let rest = &error_message[idx + 4..];
-        let rest = rest.trim_start();
-        // Extract NUON-quoted string value (starts and ends with ")
-        if let Some(stripped) = rest.strip_prefix('"') {
-            if let Some(end) = stripped.find('"') {
-                return stripped[..end].to_string();
-            }
-        }
-        // Fall back to text up to next comma or newline
-        return rest
-            .split(|c: char| c == ',' || c == '\n')
-            .next()
-            .unwrap_or(rest)
-            .trim()
-            .to_string();
-    }
-    // Fallback: first non-empty line
-    error_message
-        .lines()
-        .next()
-        .unwrap_or(error_message)
-        .to_string()
-}
-
 fn append_error_jsonl(
     path: &PathBuf,
     command: &str,
+    cwd: &str,
     error_type: &str,
-    short_error: &str,
-    error: &str,
+    error_msg: &str,
+    error_short: &str,
 ) {
-    use std::fs::OpenOptions;
-    use std::io::Write;
-
     let record = serde_json::json!({
         "timestamp": chrono::Local::now().to_rfc3339(),
         "command": command,
+        "cwd": cwd,
+        "status": "error",
         "error_type": error_type,
-        "short_error": short_error,
-        "error": error,
+        "error_msg": error_msg,
+        "error_short": error_short,
     });
+    append_jsonl(path, &record);
+}
 
-    match serde_json::to_string(&record) {
+fn append_success_jsonl(path: &PathBuf, command: &str, cwd: &str) {
+    let record = serde_json::json!({
+        "timestamp": chrono::Local::now().to_rfc3339(),
+        "command": command,
+        "cwd": cwd,
+        "status": "success",
+    });
+    append_jsonl(path, &record);
+}
+
+fn append_jsonl(path: &PathBuf, record: &serde_json::Value) {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
+    match serde_json::to_string(record) {
         Ok(line) => {
             if let Err(e) = OpenOptions::new()
                 .create(true)
@@ -251,14 +239,14 @@ fn append_error_jsonl(
                 .open(path)
                 .and_then(|mut file| {
                     writeln!(file, "{line}")
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+                        .map_err(std::io::Error::other)
                 })
             {
-                tracing::warn!("failed to write error log to {}: {e}", path.display());
+                tracing::warn!("failed to write eval log to {}: {e}", path.display());
             }
         }
         Err(e) => {
-            tracing::warn!("failed to serialize error log entry: {e}");
+            tracing::warn!("failed to serialize eval log entry: {e}");
         }
     }
 }
@@ -387,12 +375,16 @@ impl Evaluator {
         nu_source: &str,
         ct: CancellationToken,
     ) -> Result<String, rmcp::ErrorData> {
-        let (forked_state, interrupt, promote_after, error_log_path) = {
+        let (forked_state, interrupt, promote_after, error_log_path, cwd) = {
             let state = self.state.lock().await;
             let timeout = promote_timeout(&state.engine_state, &state.stack);
             let log_path = resolve_error_log_path(&state.engine_state, &state.stack);
+            let cwd = state
+                .engine_state
+                .cwd_as_string(Some(&state.stack))
+                .unwrap_or_default();
             let (forked, interrupt) = state.fork();
-            (forked, interrupt, timeout, log_path)
+            (forked, interrupt, timeout, log_path, cwd)
         };
 
         let jobs = forked_state.engine_state.jobs.clone();
@@ -416,7 +408,7 @@ impl Evaluator {
                 promote_to_background_job(result_rx, interrupt, jobs, root_job_sender, description)
             }
             result = &mut result_rx => match result {
-                Ok((new_state, eval_result)) => {
+                Ok((new_state, eval_result, error_short)) => {
                     let mut state = self.state.lock().await;
                     *state = new_state;
 
@@ -426,10 +418,13 @@ impl Evaluator {
                             append_error_jsonl(
                                 path,
                                 &source_for_log,
+                                &cwd,
                                 classify_error(&error_msg),
-                                &extract_short_error(&error_msg),
                                 &error_msg,
+                                error_short.as_deref().unwrap_or(&error_msg),
                             );
+                        } else {
+                            append_success_jsonl(path, &source_for_log, &cwd);
                         }
                     }
 
@@ -589,7 +584,11 @@ struct EvalOutput {
 /// mailbox so `job recv` returns usable data instead of a dangling `$history`
 /// reference.
 fn promote_to_background_job(
-    result_rx: oneshot::Receiver<(EvalState, Result<EvalOutput, rmcp::ErrorData>)>,
+    result_rx: oneshot::Receiver<(
+        EvalState,
+        Result<EvalOutput, rmcp::ErrorData>,
+        Option<String>,
+    )>,
     interrupt: Arc<AtomicBool>,
     jobs: Arc<SyncMutex<Jobs>>,
     root_job_sender: Sender<Mail>,
@@ -611,8 +610,8 @@ fn promote_to_background_job(
 
     tokio::spawn(async move {
         let output = match result_rx.await {
-            Ok((_state, Ok(eval_output))) => eval_output.full_output,
-            Ok((_state, Err(err))) => format!("Error: {}", err.message),
+            Ok((_state, Ok(eval_output), _)) => eval_output.full_output,
+            Ok((_state, Err(err), _)) => format!("Error: {}", err.message),
             Err(_) => "Evaluation task panicked".to_string(),
         };
 
@@ -662,15 +661,32 @@ fn job_description(source: &str) -> String {
 fn eval_inner(
     mut state: EvalState,
     nu_source: &str,
-) -> (EvalState, Result<EvalOutput, rmcp::ErrorData>) {
+) -> (
+    EvalState,
+    Result<EvalOutput, rmcp::ErrorData>,
+    Option<String>,
+) {
     let EvalState {
         engine_state,
         stack,
         history,
     } = &mut state;
 
-    let result = eval_on_state(engine_state, stack, history, nu_source);
-    (state, result)
+    let (result, shell_err) = eval_on_state(engine_state, stack, history, nu_source);
+    let error_short = shell_err.as_ref().map(format_short_error);
+    (state, result, error_short)
+}
+
+fn format_short_error(error: &ShellError) -> String {
+    use nu_protocol::ShortReportHandler;
+    let handler = ShortReportHandler::new();
+    struct ShortDisplay<'a, E>(&'a E, &'a ShortReportHandler);
+    impl<E: Diagnostic> std::fmt::Display for ShortDisplay<'_, E> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            self.1.debug(self.0, f)
+        }
+    }
+    format!("{}", ShortDisplay(error, &handler))
 }
 
 /// Core evaluation logic shared by both sync and async paths.
@@ -679,19 +695,27 @@ fn eval_on_state(
     stack: &mut Stack,
     history: &mut History,
     nu_source: &str,
-) -> Result<EvalOutput, rmcp::ErrorData> {
+) -> (Result<EvalOutput, rmcp::ErrorData>, Option<ShellError>) {
     let (block, delta) = {
         let mut working_set = StateWorkingSet::new(engine_state);
         let block = nu_parser::parse(&mut working_set, None, nu_source.as_bytes(), false);
 
         if let Some(err) = working_set.parse_errors.first() {
             let span = block.span.unwrap_or(Span::unknown());
-            return Err(user_input_error(&working_set, err, None, span));
+            let shell_err = ShellError::from_diagnostic(err);
+            return (
+                Err(user_input_error(&working_set, err, None, span)),
+                Some(shell_err),
+            );
         }
 
         if let Some(err) = working_set.compile_errors.first() {
             let span = block.span.unwrap_or(Span::unknown());
-            return Err(user_input_error(&working_set, err, None, span));
+            let shell_err = ShellError::from_diagnostic(err);
+            return (
+                Err(user_input_error(&working_set, err, None, span)),
+                Some(shell_err),
+            );
         }
 
         (block, working_set.render())
@@ -699,25 +723,44 @@ fn eval_on_state(
 
     let block_span = block.span.unwrap_or(Span::unknown());
 
-    engine_state
-        .merge_delta(delta)
-        .map_err(|e| shell_error_to_mcp_error(e, engine_state, block_span))?;
+    if let Err(e) = engine_state.merge_delta(delta) {
+        let shell_err = e.clone();
+        return (
+            Err(shell_error_to_mcp_error(e, engine_state, block_span)),
+            Some(shell_err),
+        );
+    }
 
     // Set up $history variable on the stack before evaluation
     if let Some(history_var_id) = history.var_id() {
         stack.add_var(history_var_id, history.as_value());
     }
 
-    let output =
-        nu_engine::eval_block::<WithoutDebug>(engine_state, stack, &block, PipelineData::empty())
-            .map_err(|e| shell_error_to_mcp_error(e, engine_state, block_span))?;
+    let output = match nu_engine::eval_block::<WithoutDebug>(
+        engine_state,
+        stack,
+        &block,
+        PipelineData::empty(),
+    ) {
+        Ok(o) => o,
+        Err(e) => {
+            let shell_err = e.clone();
+            return (
+                Err(shell_error_to_mcp_error(e, engine_state, block_span)),
+                Some(shell_err),
+            );
+        }
+    };
 
     let cwd = engine_state
         .cwd(Some(stack))
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| String::from("unknown"));
 
-    let (output_value, output_nuon) = process_pipeline(output, engine_state, block_span)?;
+    let (output_value, output_nuon) = match process_pipeline(output, engine_state, block_span) {
+        Ok(v) => v,
+        Err(e) => return (Err(e), None),
+    };
 
     // Create timestamp for response
     let timestamp = SystemTime::now()
@@ -754,17 +797,28 @@ fn eval_on_state(
         .style(nuon::ToStyle::Raw)
         .span(Some(block_span));
 
-    let response = nuon::to_nuon(
+    let response = match nuon::to_nuon(
         engine_state,
         &Value::record(record, block_span),
         nuon_config,
-    )
-    .map_err(|e| shell_error_to_mcp_error(e, engine_state, block_span))?;
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            let shell_err = e.clone();
+            return (
+                Err(shell_error_to_mcp_error(e, engine_state, block_span)),
+                Some(shell_err),
+            );
+        }
+    };
 
-    Ok(EvalOutput {
-        response,
-        full_output: output_nuon,
-    })
+    (
+        Ok(EvalOutput {
+            response,
+            full_output: output_nuon,
+        }),
+        None,
+    )
 }
 
 /// Returns the duration after which a running evaluation is auto-promoted
@@ -880,12 +934,13 @@ mod tests {
     use nu_engine::eval_expression;
     use nu_protocol::{
         ShellError, Signature, SyntaxShape, Value,
-        engine::{Call, Command as NuCommand, StateWorkingSet},
+        engine::{Call, Command as NuCommand},
         shell_error::io::IoError,
     };
     use std::process::{Command as ProcessCommand, Stdio};
 
     #[derive(Clone)]
+    #[cfg_attr(windows, allow(dead_code))]
     struct TestRunExternal;
 
     impl NuCommand for TestRunExternal {
@@ -1459,7 +1514,7 @@ mod tests {
         };
 
         result_tx
-            .send((state, Ok(eval_output)))
+            .send((state, Ok(eval_output), None))
             .unwrap_or_else(|_| panic!("send background result should succeed"));
 
         let err = promote_to_background_job(
@@ -1507,10 +1562,10 @@ mod tests {
             .await;
         assert!(result.is_err(), "should fail with parse error");
 
-        // No JSONL file should exist since NU_MCP_ERROR_LOG is not set
+        // No JSONL file should exist since NU_MCP_LOG is not set
         assert!(
             !std::path::Path::new(DEFAULT_ERROR_LOG_FILE).exists(),
-            "no error log file should be created when NU_MCP_ERROR_LOG is not set"
+            "no error log file should be created when NU_MCP_LOG is not set"
         );
     }
 
@@ -1548,8 +1603,8 @@ mod tests {
         assert_eq!(line["error_type"], "parse");
         assert!(line["command"].as_str().unwrap().contains("def foo"));
         assert!(line["timestamp"].as_str().is_some());
-        assert!(line["error"].as_str().is_some());
-        assert!(line["short_error"].as_str().is_some());
+        assert!(line["error_msg"].as_str().is_some());
+        assert!(line["cwd"].as_str().is_some());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1575,15 +1630,20 @@ mod tests {
             .await
             .expect("setting env var should succeed");
 
-        let result = evaluator
-            .eval_async("42", CancellationToken::new())
-            .await;
+        let result = evaluator.eval_async("42", CancellationToken::new()).await;
         assert!(result.is_ok(), "should succeed");
 
         assert!(
-            !log_path.exists(),
-            "no error log file should be created for successful evaluations"
+            log_path.exists(),
+            "success log file should be created for successful evaluations"
         );
+
+        let contents = std::fs::read_to_string(&log_path).expect("success log should exist");
+        let line: serde_json::Value =
+            serde_json::from_str(&contents).expect("log line should be valid JSON");
+        assert_eq!(line["status"], "success");
+        assert_eq!(line["command"], "42");
+        assert!(line["cwd"].as_str().is_some());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1613,8 +1673,7 @@ mod tests {
             .eval_async("let x = [1, 2, 3", CancellationToken::new())
             .await;
 
-        let contents = std::fs::read_to_string(&log_path)
-            .expect("error log file should exist");
+        let contents = std::fs::read_to_string(&log_path).expect("error log file should exist");
         let line: serde_json::Value =
             serde_json::from_str(&contents).expect("log line should be valid JSON");
 
@@ -1654,8 +1713,7 @@ mod tests {
             )
             .await;
 
-        let contents = std::fs::read_to_string(&log_path)
-            .expect("error log file should exist");
+        let contents = std::fs::read_to_string(&log_path).expect("error log file should exist");
         let line: serde_json::Value =
             serde_json::from_str(&contents).expect("log line should be valid JSON");
 
@@ -1664,8 +1722,11 @@ mod tests {
             "error make should be classified as runtime error"
         );
         assert!(
-            line["short_error"].as_str().unwrap().contains("custom runtime error"),
-            "short_error should contain the error message"
+            line["error_msg"]
+                .as_str()
+                .unwrap()
+                .contains("custom runtime error"),
+            "error_msg should contain the error message"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1689,21 +1750,5 @@ mod tests {
             classify_error("some internal error without code"),
             "runtime"
         );
-    }
-
-    #[test]
-    fn test_extract_short_error() {
-        // msg field appears mid-line in NUON format
-        let nuon_error = "{code: nu::shell::file_not_found, msg: \"File not found\", severity: error}";
-        assert_eq!(extract_short_error(nuon_error), "File not found");
-
-        let multi_line = "{code: nu::parser::unexpected_eof, msg: \"Unexpected end of code\",\nlabels: [[text]]}";
-        assert_eq!(
-            extract_short_error(multi_line),
-            "Unexpected end of code"
-        );
-
-        // No msg field — fallback to first line
-        assert_eq!(extract_short_error("just some error text"), "just some error text");
     }
 }

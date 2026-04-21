@@ -1,238 +1,154 @@
-# Nushell <!-- omit in toc -->
-[![Crates.io](https://img.shields.io/crates/v/nu.svg)](https://crates.io/crates/nu)
-[![Build Status](https://img.shields.io/github/actions/workflow/status/nushell/nushell/ci.yml?branch=main)](https://github.com/nushell/nushell/actions)
-[![Nightly Build](https://github.com/nushell/nushell/actions/workflows/nightly-build.yml/badge.svg)](https://github.com/nushell/nushell/actions/workflows/nightly-build.yml)
-[![Discord](https://img.shields.io/discord/601130461678272522.svg?logo=discord)](https://discord.gg/NtAbbGn)
-[![The Changelog #363](https://img.shields.io/badge/The%20Changelog-%23363-61c192.svg)](https://changelog.com/podcast/363)
-[![GitHub commit activity](https://img.shields.io/github/commit-activity/m/nushell/nushell)](https://github.com/nushell/nushell/graphs/commit-activity)
-[![GitHub contributors](https://img.shields.io/github/contributors/nushell/nushell)](https://github.com/nushell/nushell/graphs/contributors)
+# nushell-evo
 
-A new type of shell.
+> 基于 [Nushell](https://github.com/nushell/nushell) 的 fork，通过记录 AI 模型使用 Nushell 的命令执行情况，让模型自我进化。
 
-![Example of nushell](assets/nushell-autocomplete6.gif "Example of nushell")
+AI 模型（如 Claude）通过 MCP（Model Context Protocol）调用 Nushell 执行命令时，nushell-evo 会自动记录每一次调用的命令、目录、执行结果（成功/失败）和错误详情，生成 JSONL 格式的审计日志。这些日志可以用来：
 
-## Table of Contents <!-- omit in toc -->
+- **分析** AI 常犯的 Nushell 语法错误模式
+- **训练** 让模型更准确地使用 Nushell
+- **调试** MCP 会话中的命令执行问题
 
-- [Status](#status)
-- [Learning About Nu](#learning-about-nu)
-- [Installation](#installation)
-- [Configuration](#configuration)
-- [Philosophy](#philosophy)
-  - [Pipelines](#pipelines)
-  - [Opening files](#opening-files)
-  - [Plugins](#plugins)
-- [Goals](#goals)
-- [Officially Supported By](#officially-supported-by)
-- [Contributing](#contributing)
-- [License](#license)
+## 快速开始
 
-## Status
+### 安装
 
-This project has reached a minimum-viable-product level of quality. Many people use it as their daily driver, but it may be unstable for some commands. Nu's design is subject to change as it matures.
-
-## Learning About Nu
-
-The [Nushell book](https://www.nushell.sh/book/) is the primary source of Nushell documentation. You can find [a full list of Nu commands in the book](https://www.nushell.sh/commands/), and we have many examples of using Nu in our [cookbook](https://www.nushell.sh/cookbook/).
-
-We're also active on [Discord](https://discord.gg/NtAbbGn); come and chat with us!
-
-## Installation
-
-To quickly install Nu:
+从 [Release](https://github.com/raystyle/nushell-evo/releases) 下载对应平台的二进制，或从源码编译：
 
 ```bash
-# Linux and macOS
-brew install nushell
-# Windows
-winget install nushell
+cargo build --release
 ```
 
-To use `Nu` in GitHub Action, check [setup-nu](https://github.com/marketplace/actions/setup-nu) for more detail.
+### 启用日志
 
-Detailed installation instructions can be found in the [installation chapter of the book](https://www.nushell.sh/book/installation.html). Nu is available via many package managers:
+`NU_MCP_LOG` 是一个 Nushell 环境变量，支持以下几种配置方式：
 
-[![Packaging status](https://repology.org/badge/vertical-allrepos/nushell.svg?columns=3)](https://repology.org/project/nushell/versions)
+#### 方式一：通过 Nushell 配置文件（推荐）
 
-For details about which platforms the Nushell team actively supports, see [our platform support policy](devdocs/PLATFORM_SUPPORT.md).
+在 `config.nu` 中添加：
 
-## Configuration
-
-The default configurations can be found at [sample_config](crates/nu-utils/src/default_files)
-which are the configuration files one gets when they startup Nushell for the first time.
-
-It sets all of the default configuration to run Nushell.  From here one can
-then customize this file for their specific needs.
-
-To see where *config.nu* is located on your system simply type this command.
-
-```rust
-$nu.config-path
+```nu
+$env.NU_MCP_LOG = "/path/to/nu_evo.jsonl"
 ```
 
-Please see our [book](https://www.nushell.sh) for all of the Nushell documentation.
+这样每次启动 MCP server 时日志自动生效。编辑配置文件：
 
-
-## Philosophy
-
-Nu draws inspiration from projects like PowerShell, functional programming languages, and modern CLI tools.
-Rather than thinking of files and data as raw streams of text, Nu looks at each input as something with structure.
-For example, when you list the contents of a directory what you get back is a table of rows, where each row represents an item in that directory.
-These values can be piped through a series of steps, in a series of commands called a 'pipeline'.
-
-### Pipelines
-
-In Unix, it's common to pipe between commands to split up a sophisticated command over multiple steps.
-Nu takes this a step further and builds heavily on the idea of _pipelines_.
-As in the Unix philosophy, Nu allows commands to output to stdout and read from stdin.
-Additionally, commands can output structured data (you can think of this as a third kind of stream).
-Commands that work in the pipeline fit into one of three categories:
-
--   Commands that produce a stream (e.g., `ls`)
--   Commands that filter a stream (e.g., `where type == "dir"`)
--   Commands that consume the output of the pipeline (e.g., `table`)
-
-Commands are separated by the pipe symbol (`|`) to denote a pipeline flowing left to right.
-
-```shell
-ls | where type == "dir" | table
-# => ╭────┬──────────┬──────┬─────────┬───────────────╮
-# => │ #  │   name   │ type │  size   │   modified    │
-# => ├────┼──────────┼──────┼─────────┼───────────────┤
-# => │  0 │ .cargo   │ dir  │     0 B │ 9 minutes ago │
-# => │  1 │ assets   │ dir  │     0 B │ 2 weeks ago   │
-# => │  2 │ crates   │ dir  │ 4.0 KiB │ 2 weeks ago   │
-# => │  3 │ docker   │ dir  │     0 B │ 2 weeks ago   │
-# => │  4 │ docs     │ dir  │     0 B │ 2 weeks ago   │
-# => │  5 │ images   │ dir  │     0 B │ 2 weeks ago   │
-# => │  6 │ pkg_mgrs │ dir  │     0 B │ 2 weeks ago   │
-# => │  7 │ samples  │ dir  │     0 B │ 2 weeks ago   │
-# => │  8 │ src      │ dir  │ 4.0 KiB │ 2 weeks ago   │
-# => │  9 │ target   │ dir  │     0 B │ a day ago     │
-# => │ 10 │ tests    │ dir  │ 4.0 KiB │ 2 weeks ago   │
-# => │ 11 │ wix      │ dir  │     0 B │ 2 weeks ago   │
-# => ╰────┴──────────┴──────┴─────────┴───────────────╯
+```nu
+config nu
 ```
 
-Because most of the time you'll want to see the output of a pipeline, `table` is assumed.
-We could have also written the above:
+> `$env.NU_MCP_LOG` 的值是日志文件路径。设置为空字符串时使用默认文件名 `nu_evo.jsonl`。
 
-```shell
-ls | where type == "dir"
+#### 方式二：在 MCP 会话内动态设置
+
+如果使用 Claude Code 等 MCP 客户端，直接在对话中要求设置即可，例如："在 nushell 中设置 NU_MCP_LOG 为 /tmp/nu_evo.jsonl"。客户端会自动通过 evaluate 工具执行：
+
+```nu
+$env.NU_MCP_LOG = "/tmp/nu_evo.jsonl"
 ```
 
-Being able to use the same commands and compose them differently is an important philosophy in Nu.
-For example, we could use the built-in `ps` command to get a list of the running processes, using the same `where` as above.
+MCP 会话具有 REPL 语义，环境变量跨调用持久，设置一次后所有后续命令执行都会被记录。
 
-```shell
-ps | where cpu > 0
-# => ╭───┬───────┬───────────┬───────┬───────────┬───────────╮
-# => │ # │  pid  │   name    │  cpu  │    mem    │  virtual  │
-# => ├───┼───────┼───────────┼───────┼───────────┼───────────┤
-# => │ 0 │  2240 │ Slack.exe │ 16.40 │ 178.3 MiB │ 232.6 MiB │
-# => │ 1 │ 16948 │ Slack.exe │ 16.32 │ 205.0 MiB │ 197.9 MiB │
-# => │ 2 │ 17700 │ nu.exe    │  3.77 │  26.1 MiB │   8.8 MiB │
-# => ╰───┴───────┴───────────┴───────┴───────────┴───────────╯
+#### 方式三：通过 MCP 客户端的环境变量
+
+某些 MCP 客户端支持在启动配置中传递环境变量。例如 Claude Code 的 MCP 配置（`settings.json`）：
+
+```json
+{
+  "mcpServers": {
+    "nushell": {
+      "command": "nu",
+      "args": ["--mcp"],
+      "env": {
+        "NU_MCP_LOG": "/path/to/nu_evo.jsonl"
+      }
+    }
+  }
+}
 ```
 
-### Opening files
+> 注意：使用 `--no-config-file` 参数会跳过 config.nu 加载，此时环境变量只能通过客户端 `env` 或 MCP 会话内设置。如果希望从 config.nu 读取配置，不要加 `--no-config-file`。
 
-Nu can load file and URL contents as raw text or structured data (if it recognizes the format).
-For example, you can load a .toml file as structured data and explore it:
+## 日志格式
 
-```shell
-open Cargo.toml
-# => ╭──────────────────┬────────────────────╮
-# => │ bin              │ [table 1 row]      │
-# => │ dependencies     │ {record 25 fields} │
-# => │ dev-dependencies │ {record 8 fields}  │
-# => │ features         │ {record 10 fields} │
-# => │ package          │ {record 13 fields} │
-# => │ patch            │ {record 1 field}   │
-# => │ profile          │ {record 3 fields}  │
-# => │ target           │ {record 3 fields}  │
-# => │ workspace        │ {record 1 field}   │
-# => ╰──────────────────┴────────────────────╯
+每行一条 JSON 记录：
+
+### 成功日志
+
+```json
+{
+  "timestamp": "2026-04-21T14:08:38+08:00",
+  "command": "1 + 1",
+  "cwd": "/home/user/project",
+  "status": "success"
+}
 ```
 
-We can pipe this into a command that gets the contents of one of the columns:
+### 错误日志
 
-```shell
-open Cargo.toml | get package
-# => ╭───────────────┬────────────────────────────────────╮
-# => │ authors       │ [list 1 item]                      │
-# => │ default-run   │ nu                                 │
-# => │ description   │ A new type of shell                │
-# => │ documentation │ https://www.nushell.sh/book/       │
-# => │ edition       │ 2018                               │
-# => │ exclude       │ [list 1 item]                      │
-# => │ homepage      │ https://www.nushell.sh             │
-# => │ license       │ MIT                                │
-# => │ metadata      │ {record 1 field}                   │
-# => │ name          │ nu                                 │
-# => │ repository    │ https://github.com/nushell/nushell │
-# => │ rust-version  │ 1.60                               │
-# => │ version       │ 0.72.0                             │
-# => ╰───────────────┴────────────────────────────────────╯
+```json
+{
+  "timestamp": "2026-04-21T14:08:38+08:00",
+  "command": "badcmd xyz",
+  "cwd": "/home/user/project",
+  "status": "error",
+  "error_type": "runtime",
+  "error_msg": "{code:\"nu::shell::external_command\",msg:\"External command failed\",help:\"`badcmd` is neither a Nushell built-in or a known external command\",labels:[[text,span,line,column];[\"Command `badcmd` not found\",badcmd,1,1]]}",
+  "error_short": "External command failed: Command `badcmd` not found (`badcmd` is neither a Nushell built-in or a known external command)"
+}
 ```
 
-And if needed we can drill down further:
+### 字段说明
 
-```shell
-open Cargo.toml | get package.version
-# => 0.72.0
+| 字段 | 说明 |
+|---|---|
+| `timestamp` | 执行时间（RFC 3339） |
+| `command` | 执行的 Nushell 源代码 |
+| `cwd` | 命令执行时的工作目录 |
+| `status` | `success` 或 `error` |
+| `error_type` | `parse`（语法错误）、`compile`（编译错误）、`runtime`（运行时错误） |
+| `error_msg` | 完整错误信息（NUON 格式，包含 code、msg、help、labels） |
+| `error_short` | 简短错误描述（使用 Nushell 原生 ShortReportHandler 生成） |
+
+## 使用技巧
+
+### 按错误类型统计
+
+```bash
+cat nu_evo.jsonl | from json --objects | group-by error_type | values | each { { type: $in.0.error_type, count: ($in \| length) } }
 ```
 
-### Plugins
+### 查找最常见的错误
 
-Nu supports plugins that offer additional functionality to the shell and follow the same structured data model that built-in commands use. There are a few examples in the `crates/nu_plugins_*` directories.
+```bash
+cat nu_evo.jsonl | from json --objects | where status == error | get error_short | frequencies | first 10
+```
 
-Plugins are binaries that are available in your path and follow a `nu_plugin_*` naming convention.
-These binaries interact with nu via a simple JSON-RPC protocol where the command identifies itself and passes along its configuration, making it available for use.
-If the plugin is a filter, data streams to it one element at a time, and it can stream data back in return via stdin/stdout.
-If the plugin is a sink, it is given the full vector of final data and is given free reign over stdin/stdout to use as it pleases.
+### 查看特定时间段的失败命令
 
-The [awesome-nu repo](https://github.com/nushell/awesome-nu#plugins) lists a variety of nu-plugins while the [showcase repo](https://github.com/nushell/showcase) *shows* off informative blog posts that have been written about Nushell along with videos that highlight technical
-topics that have been presented.
+```bash
+cat nu_evo.jsonl | from json --objects | where status == error and timestamp > "2026-04-21"
+```
 
-## Goals
+### 分析某个目录下的错误
 
-Nu adheres closely to a set of goals that make up its design philosophy. As features are added, they are checked against these goals.
+```bash
+cat nu_evo.jsonl | from json --objects | where status == error and cwd =~ "my-project"
+```
 
--   First and foremost, Nu is cross-platform. Commands and techniques should work across platforms and Nu has [first-class support for Windows, macOS, and Linux](devdocs/PLATFORM_SUPPORT.md).
+### 统计成功率
 
--   Nu ensures compatibility with existing platform-specific executables.
+```bash
+cat nu_evo.jsonl | from json --objects | group-by status | values | each { { status: $in.0.status, count: ($in | length) } }
+```
 
--   Nu's workflow and tools should have the usability expected of modern software in 2022 (and beyond).
+### 与上游 Nushell 的区别
 
--   Nu views data as either structured or unstructured. It is a structured shell like PowerShell.
+nushell-evo 与上游 [Nushell](https://github.com/nushell/nushell) 的唯一区别是新增了 MCP 命令执行日志功能（`NU_MCP_LOG`），所有其他功能保持一致。
 
--   Finally, Nu views data functionally. Rather than using mutation, pipelines act as a means to load, change, and save data without mutable state.
-
-## Officially Supported By
-
-Please submit an issue or PR to be added to this list.
-
--   [zoxide](https://github.com/ajeetdsouza/zoxide)
--   [starship](https://github.com/starship/starship)
--   [oh-my-posh](https://ohmyposh.dev)
--   [Couchbase Shell](https://couchbase.sh)
--   [virtualenv](https://github.com/pypa/virtualenv)
--   [atuin](https://github.com/ellie/atuin)
--   [clap](https://github.com/clap-rs/clap/tree/master/clap_complete_nushell)
--   [Dorothy](http://github.com/bevry/dorothy)
--   [Direnv](https://github.com/direnv/direnv/blob/master/docs/hook.md#nushell)
--   [x-cmd](https://x-cmd.com/mod/nu)
--   [vfox](https://github.com/version-fox/vfox)
--   [Windmill](https://www.windmill.dev/docs/getting_started/scripts_quickstart/bash)
-
-## Contributing
-
-See [Contributing](CONTRIBUTING.md) for details. Thanks to all the people who already contributed!
-
-<a href="https://github.com/nushell/nushell/graphs/contributors">
-  <img src="https://contributors-img.web.app/image?repo=nushell/nushell&max=750&columns=20" />
-</a>
+- MCP 工具名：`evaluate`（参数 `input`），`list_commands`，`command_help`
+- 日志仅在 MCP 模式下生效，普通 REPL 不受影响
+- 与 Nushell 内置的 `--log-level` 诊断日志是独立系统，互不重叠
 
 ## License
 
-The project is made available under the MIT license. See the `LICENSE` file for more information.
+MIT（与上游 Nushell 保持一致）
