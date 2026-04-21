@@ -204,7 +204,7 @@ tabled = { version = "0.20", default-features = false }
 tempfile = "3.27"
 thiserror = "2.0.18"
 titlecase = "3.6"
-tokio = { version = "1.51.0" }
+tokio = { version = "1.52.1" }
 toml = "1.0.7"
 toml_edit = "0.25.8"
 trash = "=5.2.4"
