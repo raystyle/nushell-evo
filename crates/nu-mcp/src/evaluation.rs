@@ -7,11 +7,15 @@ use nu_protocol::{
 };
 use std::{
     fmt::Write,
+    path::PathBuf,
     sync::{Arc, Mutex as SyncMutex, atomic::AtomicBool, mpsc, mpsc::Sender},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{Mutex, oneshot};
 use tokio_util::sync::CancellationToken;
+
+const ERROR_LOG_ENV_VAR: &str = "NU_MCP_ERROR_LOG";
+const DEFAULT_ERROR_LOG_FILE: &str = "nu_mcp_error.jsonl";
 
 const OUTPUT_LIMIT_ENV_VAR: &str = "NU_MCP_OUTPUT_LIMIT";
 const DEFAULT_OUTPUT_LIMIT: usize = 10 * 1024; // 10kb
@@ -173,6 +177,92 @@ pub(crate) fn shell_error_to_mcp_error(
     )
 }
 
+fn resolve_error_log_path(engine_state: &EngineState, stack: &Stack) -> Option<PathBuf> {
+    let value = stack.get_env_var(engine_state, ERROR_LOG_ENV_VAR)?;
+    let path = value.clone().coerce_into_string().ok()?;
+    if path.is_empty() {
+        Some(PathBuf::from(DEFAULT_ERROR_LOG_FILE))
+    } else {
+        Some(PathBuf::from(path))
+    }
+}
+
+fn classify_error(error_message: &str) -> &'static str {
+    if error_message.contains("nu::parser::") {
+        "parse"
+    } else if error_message.contains("nu::compile::") {
+        "compile"
+    } else {
+        "runtime"
+    }
+}
+
+fn extract_short_error(error_message: &str) -> String {
+    // Try to extract the msg: field from NUON error text.
+    // The msg field may appear mid-line (e.g. "msg: \"File not found\", ...")
+    if let Some(idx) = error_message.find("msg:") {
+        let rest = &error_message[idx + 4..];
+        let rest = rest.trim_start();
+        // Extract NUON-quoted string value (starts and ends with ")
+        if let Some(stripped) = rest.strip_prefix('"') {
+            if let Some(end) = stripped.find('"') {
+                return stripped[..end].to_string();
+            }
+        }
+        // Fall back to text up to next comma or newline
+        return rest
+            .split(|c: char| c == ',' || c == '\n')
+            .next()
+            .unwrap_or(rest)
+            .trim()
+            .to_string();
+    }
+    // Fallback: first non-empty line
+    error_message
+        .lines()
+        .next()
+        .unwrap_or(error_message)
+        .to_string()
+}
+
+fn append_error_jsonl(
+    path: &PathBuf,
+    command: &str,
+    error_type: &str,
+    short_error: &str,
+    error: &str,
+) {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
+    let record = serde_json::json!({
+        "timestamp": chrono::Local::now().to_rfc3339(),
+        "command": command,
+        "error_type": error_type,
+        "short_error": short_error,
+        "error": error,
+    });
+
+    match serde_json::to_string(&record) {
+        Ok(line) => {
+            if let Err(e) = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .and_then(|mut file| {
+                    writeln!(file, "{line}")
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+                })
+            {
+                tracing::warn!("failed to write error log to {}: {e}", path.display());
+            }
+        }
+        Err(e) => {
+            tracing::warn!("failed to serialize error log entry: {e}");
+        }
+    }
+}
+
 /// Maximum length for job descriptions shown in `job list`.
 const JOB_DESCRIPTION_MAX_LEN: usize = 40;
 
@@ -297,11 +387,12 @@ impl Evaluator {
         nu_source: &str,
         ct: CancellationToken,
     ) -> Result<String, rmcp::ErrorData> {
-        let (forked_state, interrupt, promote_after) = {
+        let (forked_state, interrupt, promote_after, error_log_path) = {
             let state = self.state.lock().await;
             let timeout = promote_timeout(&state.engine_state, &state.stack);
+            let log_path = resolve_error_log_path(&state.engine_state, &state.stack);
             let (forked, interrupt) = state.fork();
-            (forked, interrupt, timeout)
+            (forked, interrupt, timeout, log_path)
         };
 
         let jobs = forked_state.engine_state.jobs.clone();
@@ -309,6 +400,7 @@ impl Evaluator {
 
         let source = nu_source.to_string();
         let description = job_description(&source);
+        let source_for_log = source.clone();
 
         let (result_tx, mut result_rx) = oneshot::channel();
 
@@ -327,6 +419,20 @@ impl Evaluator {
                 Ok((new_state, eval_result)) => {
                     let mut state = self.state.lock().await;
                     *state = new_state;
+
+                    if let Some(ref path) = error_log_path {
+                        if let Err(ref err) = eval_result {
+                            let error_msg = err.message.to_string();
+                            append_error_jsonl(
+                                path,
+                                &source_for_log,
+                                classify_error(&error_msg),
+                                &extract_short_error(&error_msg),
+                                &error_msg,
+                            );
+                        }
+                    }
+
                     eval_result.map(|o| o.response)
                 }
                 Err(_) => Err(rmcp::ErrorData::internal_error(
@@ -1389,5 +1495,215 @@ mod tests {
         };
 
         assert_eq!(val, "full background output");
+    }
+
+    #[tokio::test]
+    async fn test_error_log_disabled_by_default() {
+        let engine_state = nu_cmd_lang::create_default_context();
+        let evaluator = Evaluator::new(engine_state);
+
+        let result = evaluator
+            .eval_async("def foo {", CancellationToken::new())
+            .await;
+        assert!(result.is_err(), "should fail with parse error");
+
+        // No JSONL file should exist since NU_MCP_ERROR_LOG is not set
+        assert!(
+            !std::path::Path::new(DEFAULT_ERROR_LOG_FILE).exists(),
+            "no error log file should be created when NU_MCP_ERROR_LOG is not set"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_error_log_writes_on_failure() {
+        let dir = std::env::temp_dir().join("nu_mcp_error_log_test_failure");
+        std::fs::create_dir_all(&dir).ok();
+        let log_path = dir.join("test_errors.jsonl");
+        let _ = std::fs::remove_file(&log_path);
+
+        let engine_state = nu_cmd_lang::create_default_context();
+        let evaluator = Evaluator::new(engine_state);
+
+        evaluator
+            .eval_async(
+                &format!(
+                    "$env.{ERROR_LOG_ENV_VAR} = '{}'",
+                    log_path.to_string_lossy()
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("setting env var should succeed");
+
+        let result = evaluator
+            .eval_async("def foo {", CancellationToken::new())
+            .await;
+        assert!(result.is_err(), "should fail with parse error");
+
+        let contents = std::fs::read_to_string(&log_path)
+            .expect("error log file should exist after a failure");
+        let line: serde_json::Value =
+            serde_json::from_str(&contents).expect("log line should be valid JSON");
+
+        assert_eq!(line["error_type"], "parse");
+        assert!(line["command"].as_str().unwrap().contains("def foo"));
+        assert!(line["timestamp"].as_str().is_some());
+        assert!(line["error"].as_str().is_some());
+        assert!(line["short_error"].as_str().is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_error_log_skips_on_success() {
+        let dir = std::env::temp_dir().join("nu_mcp_error_log_test_success");
+        std::fs::create_dir_all(&dir).ok();
+        let log_path = dir.join("test_errors.jsonl");
+        let _ = std::fs::remove_file(&log_path);
+
+        let engine_state = nu_cmd_lang::create_default_context();
+        let evaluator = Evaluator::new(engine_state);
+
+        evaluator
+            .eval_async(
+                &format!(
+                    "$env.{ERROR_LOG_ENV_VAR} = '{}'",
+                    log_path.to_string_lossy()
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("setting env var should succeed");
+
+        let result = evaluator
+            .eval_async("42", CancellationToken::new())
+            .await;
+        assert!(result.is_ok(), "should succeed");
+
+        assert!(
+            !log_path.exists(),
+            "no error log file should be created for successful evaluations"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_error_log_classifies_parse_error() {
+        let dir = std::env::temp_dir().join("nu_mcp_error_log_test_parse");
+        std::fs::create_dir_all(&dir).ok();
+        let log_path = dir.join("test_errors.jsonl");
+        let _ = std::fs::remove_file(&log_path);
+
+        let engine_state = nu_cmd_lang::create_default_context();
+        let evaluator = Evaluator::new(engine_state);
+
+        evaluator
+            .eval_async(
+                &format!(
+                    "$env.{ERROR_LOG_ENV_VAR} = '{}'",
+                    log_path.to_string_lossy()
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("setting env var should succeed");
+
+        let _ = evaluator
+            .eval_async("let x = [1, 2, 3", CancellationToken::new())
+            .await;
+
+        let contents = std::fs::read_to_string(&log_path)
+            .expect("error log file should exist");
+        let line: serde_json::Value =
+            serde_json::from_str(&contents).expect("log line should be valid JSON");
+
+        assert_eq!(
+            line["error_type"], "parse",
+            "unclosed bracket should be classified as parse error"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_error_log_classifies_runtime_error() {
+        let dir = std::env::temp_dir().join("nu_mcp_error_log_test_runtime");
+        std::fs::create_dir_all(&dir).ok();
+        let log_path = dir.join("test_errors.jsonl");
+        let _ = std::fs::remove_file(&log_path);
+
+        let engine_state = nu_cmd_lang::create_default_context();
+        let evaluator = Evaluator::new(engine_state);
+
+        evaluator
+            .eval_async(
+                &format!(
+                    "$env.{ERROR_LOG_ENV_VAR} = '{}'",
+                    log_path.to_string_lossy()
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("setting env var should succeed");
+
+        let _ = evaluator
+            .eval_async(
+                r#"error make {msg: "custom runtime error" label: {text: "problem here" span: {start: 0 end: 5}}}"#,
+                CancellationToken::new(),
+            )
+            .await;
+
+        let contents = std::fs::read_to_string(&log_path)
+            .expect("error log file should exist");
+        let line: serde_json::Value =
+            serde_json::from_str(&contents).expect("log line should be valid JSON");
+
+        assert_eq!(
+            line["error_type"], "runtime",
+            "error make should be classified as runtime error"
+        );
+        assert!(
+            line["short_error"].as_str().unwrap().contains("custom runtime error"),
+            "short_error should contain the error message"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_classify_error() {
+        assert_eq!(
+            classify_error("{code: nu::parser::unexpected_eof, msg: \"...\"}"),
+            "parse"
+        );
+        assert_eq!(
+            classify_error("{code: nu::compile::type_mismatch, msg: \"...\"}"),
+            "compile"
+        );
+        assert_eq!(
+            classify_error("{code: nu::shell::file_not_found, msg: \"...\"}"),
+            "runtime"
+        );
+        assert_eq!(
+            classify_error("some internal error without code"),
+            "runtime"
+        );
+    }
+
+    #[test]
+    fn test_extract_short_error() {
+        // msg field appears mid-line in NUON format
+        let nuon_error = "{code: nu::shell::file_not_found, msg: \"File not found\", severity: error}";
+        assert_eq!(extract_short_error(nuon_error), "File not found");
+
+        let multi_line = "{code: nu::parser::unexpected_eof, msg: \"Unexpected end of code\",\nlabels: [[text]]}";
+        assert_eq!(
+            extract_short_error(multi_line),
+            "Unexpected end of code"
+        );
+
+        // No msg field — fallback to first line
+        assert_eq!(extract_short_error("just some error text"), "just some error text");
     }
 }
