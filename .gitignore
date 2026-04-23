@@ -63,3 +63,8 @@ tarpaulin-report.html
 
 # skills
 .github/skills/*
+# Local tool config
+.claude/
+
+# Runtime logs
+nu_evo.jsonl
