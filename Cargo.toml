@@ -142,7 +142,7 @@ mime = "0.3.17"
 mime_guess = "2.0"
 mq-markdown = "0.5.26"
 mockito = { version = "1.7.2", default-features = false }
-multipart-rs = "0.1.13"
+multipart-rs = "0.2.1"
 native-tls = "0.2.18"
 nix = { version = "0.31.2", default-features = false }
 notify-debouncer-full = { version = "0.3", default-features = false }
