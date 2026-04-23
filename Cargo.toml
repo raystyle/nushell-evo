@@ -79,6 +79,7 @@ members = [
   "crates/nu-utils",
   "crates/nuon",
   "crates/nu-mcp",
+  "crates/nu_plugin_browse",
 ]
 
 [workspace.dependencies]

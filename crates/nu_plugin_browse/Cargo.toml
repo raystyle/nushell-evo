@@ -1,0 +1,25 @@
+[package]
+authors = ["Tyarel8"]
+description = "A nushell plugin to make http requests with a headless browser"
+repository = "https://github.com/Tyarel8/nu_plugin_browse"
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT"
+name = "nu_plugin_browse"
+version = "0.112.3"
+
+[lib]
+doctest = false
+bench = false
+
+[[bin]]
+name = "nu_plugin_browse"
+bench = false
+
+[dependencies]
+chaser-oxide = "0.2"
+futures = "0.3.32"
+nu-plugin = { path = "../nu-plugin", version = "0.112.3" }
+nu-protocol = { path = "../nu-protocol", version = "0.112.3", features = ["plugin"] }
+regex = "1"
+tokio = { workspace = true, features = ["full"] }

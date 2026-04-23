@@ -143,11 +143,41 @@ cat nu_evo.jsonl | from json --objects | group-by status | values | each { { sta
 
 ### 与上游 Nushell 的区别
 
-nushell-evo 与上游 [Nushell](https://github.com/nushell/nushell) 的唯一区别是新增了 MCP 命令执行日志功能（`NU_MCP_LOG`），所有其他功能保持一致。
+nushell-evo 与上游 [Nushell](https://github.com/nushell/nushell) 的区别：
+
+- **MCP 命令执行日志**（`NU_MCP_LOG`）— 记录 AI 模型通过 MCP 执行的每条命令
+- **内置 `browse` 插件**（[nu_plugin_browse](crates/nu_plugin_browse/README.md)）— headless 浏览器插件，支持 JS 执行、网络追踪、持久会话
+
+#### MCP 日志
 
 - MCP 工具名：`evaluate`（参数 `input`），`list_commands`，`command_help`
 - 日志仅在 MCP 模式下生效，普通 REPL 不受影响
 - 与 Nushell 内置的 `--log-level` 诊断日志是独立系统，互不重叠
+
+#### browse 插件
+
+需要系统安装 Chrome 或 Chromium。
+
+```nu
+# 一次性获取页面 HTML（ephemeral 浏览器，自动关闭）
+browse https://example.com
+
+# 执行 JavaScript（隔离世界）
+browse https://example.com --eval "document.title"
+
+# 执行 JavaScript（主世界，可访问页面变量）
+browse https://example.com --real-eval "window.appState"
+
+# 网络追踪（完整 headers + response body）
+browse https://example.com --ntrace '.*'
+
+# 持久浏览器（跨调用复用 cookie/localStorage）
+browse open https://example.com
+browse open --eval "document.title"
+browse close
+```
+
+完整文档见 [crates/nu_plugin_browse/README.md](crates/nu_plugin_browse/README.md)。
 
 ## License
 

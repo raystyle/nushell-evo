@@ -177,14 +177,15 @@ pub(crate) fn shell_error_to_mcp_error(
     )
 }
 
-fn resolve_error_log_path(engine_state: &EngineState, stack: &Stack) -> Option<PathBuf> {
-    let value = stack.get_env_var(engine_state, ERROR_LOG_ENV_VAR)?;
-    let path = value.clone().coerce_into_string().ok()?;
-    if path.is_empty() {
-        Some(PathBuf::from(DEFAULT_ERROR_LOG_FILE))
-    } else {
-        Some(PathBuf::from(path))
+fn resolve_error_log_path(engine_state: &EngineState, stack: &Stack, cwd: &str) -> PathBuf {
+    if let Some(value) = stack.get_env_var(engine_state, ERROR_LOG_ENV_VAR) {
+        if let Ok(path) = value.clone().coerce_into_string() {
+            if !path.is_empty() {
+                return PathBuf::from(path);
+            }
+        }
     }
+    PathBuf::from(cwd).join(DEFAULT_ERROR_LOG_FILE)
 }
 
 fn classify_error(error_message: &str) -> &'static str {
@@ -378,11 +379,11 @@ impl Evaluator {
         let (forked_state, interrupt, promote_after, error_log_path, cwd) = {
             let state = self.state.lock().await;
             let timeout = promote_timeout(&state.engine_state, &state.stack);
-            let log_path = resolve_error_log_path(&state.engine_state, &state.stack);
             let cwd = state
                 .engine_state
                 .cwd_as_string(Some(&state.stack))
                 .unwrap_or_default();
+            let log_path = resolve_error_log_path(&state.engine_state, &state.stack, &cwd);
             let (forked, interrupt) = state.fork();
             (forked, interrupt, timeout, log_path, cwd)
         };
@@ -412,20 +413,18 @@ impl Evaluator {
                     let mut state = self.state.lock().await;
                     *state = new_state;
 
-                    if let Some(ref path) = error_log_path {
-                        if let Err(ref err) = eval_result {
-                            let error_msg = err.message.to_string();
-                            append_error_jsonl(
-                                path,
-                                &source_for_log,
-                                &cwd,
-                                classify_error(&error_msg),
-                                &error_msg,
-                                error_short.as_deref().unwrap_or(&error_msg),
-                            );
-                        } else {
-                            append_success_jsonl(path, &source_for_log, &cwd);
-                        }
+                    if let Err(ref err) = eval_result {
+                        let error_msg = err.message.to_string();
+                        append_error_jsonl(
+                            &error_log_path,
+                            &source_for_log,
+                            &cwd,
+                            classify_error(&error_msg),
+                            &error_msg,
+                            error_short.as_deref().unwrap_or(&error_msg),
+                        );
+                    } else {
+                        append_success_jsonl(&error_log_path, &source_for_log, &cwd);
                     }
 
                     eval_result.map(|o| o.response)
@@ -1561,20 +1560,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_error_log_disabled_by_default() {
-        let engine_state = nu_cmd_lang::create_default_context();
+    async fn test_error_log_defaults_to_cwd() {
+        let dir = std::env::temp_dir().join("nu_mcp_error_log_test_cwd");
+        std::fs::create_dir_all(&dir).ok();
+        let _ = std::fs::remove_file(dir.join(DEFAULT_ERROR_LOG_FILE));
+
+        let mut engine_state = nu_cmd_lang::create_default_context();
+        engine_state.add_env_var("PWD".into(), Value::test_string(dir.to_string_lossy()));
         let evaluator = Evaluator::new(engine_state);
 
-        let result = evaluator
+        let _ = evaluator
             .eval_async("def foo {", CancellationToken::new())
             .await;
-        assert!(result.is_err(), "should fail with parse error");
 
-        // No JSONL file should exist since NU_MCP_LOG is not set
+        let log_file = dir.join(DEFAULT_ERROR_LOG_FILE);
         assert!(
-            !std::path::Path::new(DEFAULT_ERROR_LOG_FILE).exists(),
-            "no error log file should be created when NU_MCP_LOG is not set"
+            log_file.exists(),
+            "error log should be created in CWD when NU_MCP_LOG is not set"
         );
+
+        let contents = std::fs::read_to_string(&log_file)
+            .expect("error log file should be readable");
+        let last_line = contents.lines().next_back().expect("log should have at least one line");
+        let line: serde_json::Value =
+            serde_json::from_str(last_line).expect("log line should be valid JSON");
+        assert_eq!(line["error_type"], "parse");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

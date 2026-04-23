@@ -17,14 +17,27 @@ AGENTS.md
 ## MCP 命令执行日志
 
 - `crates/nu-mcp/src/evaluation.rs` 实现了 MCP 模式下的命令执行审计日志
-- 通过 `NU_MCP_LOG` 环境变量控制（在 MCP 会话内通过 `$env.NU_MCP_LOG = "路径"` 设置）
-- 默认日志文件：`nu_evo.jsonl`
+- 默认始终记录日志，保存到当前工作目录（CWD）下的 `nu_evo.jsonl`
+- 可通过 `NU_MCP_LOG` 环境变量自定义日志路径（在 MCP 会话内通过 `$env.NU_MCP_LOG = "路径"` 设置）
 - JSONL 格式，每条记录：`{timestamp, command, cwd, status, error_type?, error_msg?, error_short?}`
 - 成功日志：`{timestamp, command, cwd, status: "success"}`
 - 错误日志：`{timestamp, command, cwd, status: "error", error_type: "parse"|"compile"|"runtime", error_msg: "...", error_short: "..."}`
 - `error_short` 使用 Nushell 原生 `ShortReportHandler` 生成，格式 `{diagnostic}: {label} ({help})`
 - 与 Nushell 内置的 `--log-level` 诊断日志（Rust tracing）是不同用途，互不重叠
 - MCP 工具名是 `evaluate`（不是 `eval`），参数名是 `input`（不是 `source`）
+
+## 内置插件
+
+- `nu_plugin_browse`（来源：[Tyarel8/nu_plugin_browse](https://github.com/Tyarel8/nu_plugin_browse)）— headless 浏览器插件，使用 `chaser-oxide`（CDP 协议），需要系统安装 chrome/chromium
+- 使用方式：`cargo build -p nu_plugin_browse` 后运行 `plugin add target/debug/nu_plugin_browse && plugin use browse`
+- 命令：
+  - `browse <url>` — 一次性获取页面 HTML（ephemeral 浏览器，自动关闭）
+  - `browse <url> --open` — 等价于 `browse open <url>`，打开持久浏览器
+  - `browse open [url]` — 打开/连接持久浏览器（显示窗口），跨调用复用 cookie/localStorage
+  - `browse close` — 关闭持久浏览器
+- 参数：`--init-script <path>`（页面脚本前注入 JS）、`--eval <js>` / `-e`（隔离世界执行 JS，支持管道输入）、`--real-eval <js>`（主世界执行 JS）、`--no-stealth`、`--with-head`、`-w <duration>`、`--ntrace <pattern>`（网络追踪，默认含完整 headers 和 response body）
+- Session 管理：`.nu_browse_profile/` 目录存储 Chrome profile 和 `.session` 文件，单 session 覆盖模式（`browse open` 自动回收旧 session）
+- 错误处理：eval 错误返回 `{status: error, message: "eval error: ..."}` record，不会抛异常
 
 ## 开发经验
 
