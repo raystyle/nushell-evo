@@ -358,7 +358,16 @@ print $"  status: ($r30.status)"
 assert ($r30.status == "error")
 
 # ─────────────────────────────────────────────────────────────────
+print $"\n=== 34. 不规范 URL 应报错 ==="
+sleep 500ms
+let r34 = browse baidu.com
+print $"  status: ($r34.status)"
+assert ($r34.status == "error")
+assert ($r34.message =~ "invalid URL")
+assert ($r34.message =~ "http://")
+
+# ─────────────────────────────────────────────────────────────────
 # 清理
 try { browse close } catch { }
 
-print $"\n=== 所有 33 项测试通过 ==="
+print $"\n=== 所有 34 项测试通过 ==="

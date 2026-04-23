@@ -189,6 +189,14 @@ fn check_eval_result(s: &str) -> Result<String, String> {
     }
 }
 
+fn ensure_url(url: &str) -> Result<String, String> {
+    if url.starts_with("http://") || url.starts_with("https://") {
+        Ok(url.to_string())
+    } else {
+        Err(format!("invalid URL '{url}': must start with http:// or https://"))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shared: navigate, wait, eval, extract
 // ---------------------------------------------------------------------------
@@ -728,6 +736,12 @@ impl SimplePluginCommand for Browse {
 
                 match (url, eval_js) {
                     (Some(url), eval_js) => {
+                        if let Err(msg) = ensure_url(&url) {
+                            record.push("status", Value::string("error", call.head));
+                            record.push("url", Value::string(&url, call.head));
+                            record.push("message", Value::string(msg, call.head));
+                            return Ok(Value::record(record, call.head));
+                        }
                         // Destroy old session if exists, start fresh
                         try_close_existing(&cwd).await;
 
@@ -896,6 +910,14 @@ impl SimplePluginCommand for Browse {
                         return Ok(Value::record(record, call.head));
                     }
                 };
+
+                if let Err(msg) = ensure_url(&url) {
+                    let mut record = Record::new();
+                    record.push("status", Value::string("error", call.head));
+                    record.push("url", Value::string(&url, call.head));
+                    record.push("message", Value::string(msg, call.head));
+                    return Ok(Value::record(record, call.head));
+                }
 
                 if has_active_session(&cwd) {
                     let mut record = Record::new();
@@ -1119,6 +1141,12 @@ impl SimplePluginCommand for BrowseOpen {
 
             match (url, eval_js) {
                 (Some(url), eval_js) => {
+                    if let Err(msg) = ensure_url(&url) {
+                        record.push("status", Value::string("error", call.head));
+                        record.push("url", Value::string(&url, call.head));
+                        record.push("message", Value::string(msg, call.head));
+                        return Ok(Value::record(record, call.head));
+                    }
                     // Destroy old session if exists, start fresh
                     try_close_existing(&cwd).await;
 
