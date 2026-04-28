@@ -68,3 +68,6 @@ tarpaulin-report.html
 
 # Runtime logs
 nu_evo.jsonl
+
+# Agent knowledge
+.knowledge/
