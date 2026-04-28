@@ -202,7 +202,7 @@ impl SimplePluginCommand for Browse {
                 }
 
                 let result: Result<(chaser_oxide::Browser, chaser_oxide::Page), Box<dyn Error>> =
-                    async { launch_ephemeral(with_head).await }.await;
+                    async { launch_ephemeral(with_head, &cwd).await }.await;
 
                 let (mut browser, page) = result.map_err(|e| {
                     LabeledError::new(format!("{e}")).with_label("browse failed", call.head)

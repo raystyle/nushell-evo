@@ -3,7 +3,7 @@ use futures::StreamExt;
 use std::error::Error;
 use std::time::Duration;
 
-use crate::session::{DEFAULT_DEBUG_PORT, profile_dir, save_session};
+use crate::session::{DEFAULT_DEBUG_PORT, profile_dir, ensure_profile_dir, save_session};
 
 pub fn viewport_config(with_head: bool) -> Option<Viewport> {
     if with_head {
@@ -44,8 +44,11 @@ pub async fn launch_persistent(cwd: &str) -> Result<(Browser, Page), Box<dyn Err
     Ok((browser, page))
 }
 
-pub async fn launch_ephemeral(with_head: bool) -> Result<(Browser, Page), Box<dyn Error>> {
+pub async fn launch_ephemeral(with_head: bool, cwd: &str) -> Result<(Browser, Page), Box<dyn Error>> {
+    let dir = ensure_profile_dir(cwd);
+
     let mut config = BrowserConfig::builder()
+        .user_data_dir(&dir)
         .window_size(1920, 1080)
         .viewport(viewport_config(with_head))
         .arg("--test-type");

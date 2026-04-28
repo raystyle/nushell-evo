@@ -1,6 +1,6 @@
 use chaser_oxide::cdp::browser_protocol::network::{
-    EnableParams as NetworkEnableParams, EventLoadingFinished, EventRequestWillBeSent,
-    EventResponseReceived, GetResponseBodyParams,
+    EnableParams as NetworkEnableParams, EventLoadingFinished, EventLoadingFailed,
+    EventRequestWillBeSent, EventResponseReceived, GetResponseBodyParams, ResourceType,
 };
 use chaser_oxide::cdp::js_protocol::runtime::EnableParams as RuntimeEnableParams;
 use chaser_oxide::cdp::js_protocol::runtime::EventExceptionThrown;
@@ -10,58 +10,12 @@ use nu_protocol::{Record, Span, Value};
 use regex::Regex;
 use std::error::Error;
 use std::fs;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::Notify;
 
 use crate::utils::{wrap_eval_js, check_eval_result};
-
-const NETWORK_IDLE_JS: &str = r#"() =>
-  new Promise((resolve) => {
-    let activeRequests = 0;
-    let idleTimer;
-
-    const done = (label) => {
-      clearTimeout(idleTimer);
-      idleTimer = setTimeout(() => resolve(`${label}-network-idle`), 500);
-    };
-
-    const origOpen = XMLHttpRequest.prototype.open;
-    XMLHttpRequest.prototype.open = function (...args) {
-      this.addEventListener('loadstart', () => {
-        activeRequests++;
-        clearTimeout(idleTimer);
-      });
-      this.addEventListener('loadend', () => {
-        activeRequests--;
-        if (activeRequests <= 0) done('xhr');
-      });
-      origOpen.apply(this, args);
-    };
-
-    const origFetch = window.fetch;
-    window.fetch = async function (...args) {
-      activeRequests++;
-      clearTimeout(idleTimer);
-      try {
-        const response = await origFetch.apply(this, args);
-        return response;
-      } finally {
-        activeRequests--;
-        if (activeRequests <= 0) done('fetch');
-      }
-    };
-
-    const maybeResolveImmediately = () => {
-      if (document.readyState === 'complete' && activeRequests === 0) {
-        done('initial');
-      } else {
-        window.addEventListener('load', () => done('load'), { once: true });
-      }
-    };
-
-    maybeResolveImmediately();
-  })"#;
 
 #[allow(clippy::too_many_arguments)]
 pub async fn page_navigate(
@@ -87,6 +41,10 @@ pub async fn page_navigate(
     let stop_flag = Arc::new(AtomicBool::new(false));
     let network_log: Arc<Mutex<Vec<Record>>> = Arc::new(Mutex::new(Vec::new()));
     let init_exceptions: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+    // Event-driven network idle: track pending request count via CDP events.
+    let pending_count: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
+    let all_done: Arc<Notify> = Arc::new(Notify::new());
 
     if init_script.is_some() {
         let _ = chaser
@@ -119,131 +77,183 @@ pub async fn page_navigate(
                         );
                         exc_log.lock().unwrap().push(msg);
                     }
-                    _ => break,
+                    Ok(None) => break,
+                    Err(_) => {}
                 }
             }
         });
     }
 
-    if let Some((show_req, show_res, filter)) = &ntrace {
-        let enable_params = NetworkEnableParams {
-            max_total_buffer_size: Some(50_000_000),
-            max_resource_buffer_size: Some(5_000_000),
-            ..Default::default()
-        };
-        let _ = chaser.raw_page().execute(enable_params).await;
+    // Always enable CDP Network domain for event-driven idle detection.
+    let enable_params = NetworkEnableParams {
+        max_total_buffer_size: Some(50_000_000),
+        max_resource_buffer_size: Some(5_000_000),
+        ..Default::default()
+    };
+    let _ = chaser.raw_page().execute(enable_params).await;
 
-        if *show_req {
-            let log = network_log.clone();
-            let stop = stop_flag.clone();
-            let filter = filter.clone();
-            let listener_span = span;
-            let mut events = chaser
-                .raw_page()
-                .event_listener::<EventRequestWillBeSent>()
-                .await?;
-            tokio::spawn(async move {
-                loop {
-                    if stop.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    match tokio::time::timeout(Duration::from_millis(200), events.next()).await {
-                        Ok(Some(event)) => {
-                            if filter
-                                .as_ref()
-                                .is_none_or(|r| r.is_match(&event.request.url))
-                            {
-                                let mut rec = Record::new();
-                                rec.push("type", Value::string("request", listener_span));
-                                rec.push(
-                                    "method",
-                                    Value::string(&event.request.method, listener_span),
-                                );
-                                rec.push("url", Value::string(&event.request.url, listener_span));
-                                rec.push(
-                                    "headers",
-                                    Value::string(
-                                        event.request.headers.inner().to_string(),
-                                        listener_span,
-                                    ),
-                                );
-                                log.lock().unwrap().push(rec);
-                            }
+    let show_req = ntrace.as_ref().is_some_and(|(r, _, _)| *r);
+    let show_res = ntrace.as_ref().is_some_and(|(_, r, _)| *r);
+    let filter = ntrace.as_ref().and_then(|(_, _, f)| f.clone());
+    let filter_res = filter.clone();
+
+    // Single RequestWillBeSent listener: handles both ntrace recording and pending count.
+    {
+        let log = network_log.clone();
+        let stop = stop_flag.clone();
+        let pending = pending_count.clone();
+        let listener_span = span;
+        let mut events = chaser
+            .raw_page()
+            .event_listener::<EventRequestWillBeSent>()
+            .await?;
+        tokio::spawn(async move {
+            loop {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                match tokio::time::timeout(Duration::from_millis(200), events.next()).await {
+                    Ok(Some(event)) => {
+                        // Skip persistent connections (SSE, WebSocket) — they never finish.
+                        let is_persistent = matches!(
+                            event.r#type,
+                            Some(ResourceType::EventSource) | Some(ResourceType::WebSocket)
+                        );
+                        if !is_persistent {
+                            pending.fetch_add(1, Ordering::Relaxed);
                         }
-                        _ => break,
-                    }
-                }
-            });
-        }
-
-        if *show_res {
-            let log = network_log.clone();
-            let stop = stop_flag.clone();
-            let filter = filter.clone();
-            let listener_span = span;
-            let mut events = chaser
-                .raw_page()
-                .event_listener::<EventResponseReceived>()
-                .await?;
-            tokio::spawn(async move {
-                loop {
-                    if stop.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    match tokio::time::timeout(Duration::from_millis(200), events.next()).await {
-                        Ok(Some(event)) => {
-                            if filter
-                                .as_ref()
-                                .is_none_or(|r| r.is_match(&event.response.url))
-                            {
-                                let mut rec = Record::new();
-                                rec.push("type", Value::string("response", listener_span));
-                                rec.push(
-                                    "id",
-                                    Value::string(event.request_id.as_ref(), listener_span),
-                                );
-                                rec.push(
-                                    "status",
-                                    Value::int(event.response.status, listener_span),
-                                );
-                                rec.push("url", Value::string(&event.response.url, listener_span));
-                                rec.push(
-                                    "mime",
-                                    Value::string(&event.response.mime_type, listener_span),
-                                );
-                                rec.push(
-                                    "headers",
-                                    Value::string(
-                                        event.response.headers.inner().to_string(),
-                                        listener_span,
-                                    ),
-                                );
-                                log.lock().unwrap().push(rec);
-                            }
+                        if show_req && filter
+                            .as_ref()
+                            .is_none_or(|r| r.is_match(&event.request.url))
+                        {
+                            let mut rec = Record::new();
+                            rec.push("type", Value::string("request", listener_span));
+                            rec.push(
+                                "method",
+                                Value::string(&event.request.method, listener_span),
+                            );
+                            rec.push("url", Value::string(&event.request.url, listener_span));
+                            rec.push(
+                                "headers",
+                                Value::string(
+                                    event.request.headers.inner().to_string(),
+                                    listener_span,
+                                ),
+                            );
+                            log.lock().unwrap().push(rec);
                         }
-                        _ => break,
                     }
+                    Ok(None) => break,
+                    Err(_) => {}
                 }
-            });
+            }
+        });
+    }
 
-            let stop = stop_flag.clone();
-            let mut load_events = chaser
-                .raw_page()
-                .event_listener::<EventLoadingFinished>()
-                .await?;
-            tokio::spawn(async move {
-                loop {
-                    if stop.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    match tokio::time::timeout(Duration::from_millis(200), load_events.next()).await
-                    {
-                        Ok(Some(_)) => {}
-                        _ => break,
-                    }
+    if show_res {
+        let log = network_log.clone();
+        let stop = stop_flag.clone();
+        let listener_span = span;
+        let mut events = chaser
+            .raw_page()
+            .event_listener::<EventResponseReceived>()
+            .await?;
+        tokio::spawn(async move {
+            loop {
+                if stop.load(Ordering::Relaxed) {
+                    break;
                 }
-            });
-        }
+                match tokio::time::timeout(Duration::from_millis(200), events.next()).await {
+                    Ok(Some(event)) => {
+                        if filter_res
+                            .as_ref()
+                            .is_none_or(|r| r.is_match(&event.response.url))
+                        {
+                            let mut rec = Record::new();
+                            rec.push("type", Value::string("response", listener_span));
+                            rec.push(
+                                "id",
+                                Value::string(event.request_id.as_ref(), listener_span),
+                            );
+                            rec.push(
+                                "status",
+                                Value::int(event.response.status, listener_span),
+                            );
+                            rec.push("url", Value::string(&event.response.url, listener_span));
+                            rec.push(
+                                "mime",
+                                Value::string(&event.response.mime_type, listener_span),
+                            );
+                            rec.push(
+                                "headers",
+                                Value::string(
+                                    event.response.headers.inner().to_string(),
+                                    listener_span,
+                                ),
+                            );
+                            log.lock().unwrap().push(rec);
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(_) => {}
+                }
+            }
+        });
+    }
+
+    // LoadingFinished / LoadingFailed → decrement pending count, notify when idle.
+    {
+        let pending = pending_count.clone();
+        let done = all_done.clone();
+        let stop = stop_flag.clone();
+        let mut load_events = chaser
+            .raw_page()
+            .event_listener::<EventLoadingFinished>()
+            .await?;
+        tokio::spawn(async move {
+            loop {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                match tokio::time::timeout(Duration::from_millis(200), load_events.next()).await {
+                    Ok(Some(_)) => {
+                        let prev = pending.fetch_sub(1, Ordering::Relaxed);
+                        if prev == 1 {
+                            done.notify_one();
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(_) => {}
+                }
+            }
+        });
+    }
+
+    {
+        let pending = pending_count.clone();
+        let done = all_done.clone();
+        let stop = stop_flag.clone();
+        let mut fail_events = chaser
+            .raw_page()
+            .event_listener::<EventLoadingFailed>()
+            .await?;
+        tokio::spawn(async move {
+            loop {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                match tokio::time::timeout(Duration::from_millis(200), fail_events.next()).await {
+                    Ok(Some(_)) => {
+                        let prev = pending.fetch_sub(1, Ordering::Relaxed);
+                        if prev == 1 {
+                            done.notify_one();
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(_) => {}
+                }
+            }
+        });
     }
 
     chaser.goto(url).await?;
@@ -252,7 +262,23 @@ pub async fn page_navigate(
         tokio::time::sleep(d).await;
     }
 
-    chaser.evaluate(NETWORK_IDLE_JS).await?;
+    // Event-driven idle: wait for all regular (non-persistent) requests to finish.
+    // Persistent connections (SSE, WebSocket) are excluded from pending count.
+    // 300ms debounce after pending reaches 0 to catch cascading requests.
+    // 10s hard timeout as safety net.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if pending_count.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                if pending_count.load(Ordering::Relaxed) == 0 {
+                    break;
+                }
+            } else {
+                let _ = all_done.notified().await;
+            }
+        }
+    })
+    .await.ok();
 
     stop_flag.store(true, Ordering::Relaxed);
     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -336,7 +362,8 @@ pub async fn page_eval_only(
     js: &str,
     real_eval: bool,
 ) -> Result<String, Box<dyn Error>> {
-    chaser.evaluate(NETWORK_IDLE_JS).await?;
+    // For eval-only mode, just run the JS without network idle wait.
+    // The persistent browser session handles timing externally.
     let wrapped = wrap_eval_js(js);
     if real_eval {
         let result = chaser

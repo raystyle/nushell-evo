@@ -11,6 +11,12 @@ pub fn profile_dir(cwd: &str) -> PathBuf {
     PathBuf::from(cwd).join(PROFILE_DIR)
 }
 
+pub fn ensure_profile_dir(cwd: &str) -> PathBuf {
+    let dir = profile_dir(cwd);
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
 pub fn session_file(cwd: &str) -> PathBuf {
     profile_dir(cwd).join(SESSION_FILE)
 }
