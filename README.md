@@ -171,9 +171,18 @@ browse https://example.com --real-eval "window.appState"
 # 网络追踪（完整 headers + response body）
 browse https://example.com --ntrace '.*'
 
-# 持久浏览器（跨调用复用 cookie/localStorage）
+# 持久浏览器（默认无头，跨调用复用 cookie/localStorage）
 browse open https://example.com
 browse open --eval "document.title"
+
+# 持久浏览器 + 显示窗口
+browse open https://example.com --with-head
+
+# 查询持久浏览器状态
+browse status
+# => {status: "active", url: "...", session: "...", profile: "..."}
+
+# 关闭持久浏览器
 browse close
 ```
 

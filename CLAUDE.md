@@ -34,10 +34,13 @@ AGENTS.md
   - `browse <url>` — 一次性获取页面 HTML（ephemeral 浏览器，自动关闭）
   - `browse <url> --open` — 等价于 `browse open <url>`，打开持久浏览器
   - `browse open [url]` — 打开/连接持久浏览器（默认无头，`--with-head` 显示窗口），跨调用复用 cookie/localStorage
+  - `browse status` — 查询持久浏览器会话状态（返回 `{status, url?, session?, profile?}`），不启动浏览器
   - `browse close` — 关闭持久浏览器
 - 参数：`--init-script <path>`（页面脚本前注入 JS）、`--eval <js>` / `-e`（隔离世界执行 JS，支持管道输入）、`--real-eval <js>`（主世界执行 JS）、`--no-stealth`、`--with-head`、`-w <duration>`、`--ntrace <pattern>`（网络追踪，默认含完整 headers 和 response body）
 - Session 管理：`.nu_browse_profile/` 目录存储 Chrome profile 和 `.session` 文件，单 session 覆盖模式（`browse open` 自动回收旧 session）
+- `has_active_session` 是乐观检查（仅判断 `.session` 文件是否存在），实际连接在 `try_close_existing` 或 `Browser::connect` 时验证
 - 错误处理：eval 错误返回 `{status: error, message: "eval error: ..."}` record，不会抛异常
+- 浏览器生命周期：持久浏览器用 `ManuallyDrop` 保持进程存活（不用 `mem::forget`），ephemeral 浏览器 drop 时自动关闭
 
 ## 开发经验
 
@@ -46,3 +49,5 @@ AGENTS.md
 - Nushell 的 `ErrorStyle::Short` 对应 `ShortReportHandler`（`crates/nu-protocol/src/errors/short_handler.rs`），通过 `Display` trait 使用，不能用 `Formatter::new()` 构造（unstable API），需用 wrapper struct 实现 `Display`
 - `ShellError::from_diagnostic` 可将 `ParseError`/`CompileError` 转为 `ShellError`
 - GitHub Actions 取消构建用 `gh run cancel <id>`，删除构建用 `gh run delete <id>`
+- `page_navigate` 使用 `NavigateParams` struct 而非 10 个独立参数；CDP 事件监听通过 `spawn_listener` helper 统一处理
+- timing 常量定义在 `page.rs` 顶部（`EVENT_POLL_INTERVAL`、`NETWORK_IDLE_DEBOUNCE`、`NAVIGATE_HARD_TIMEOUT`、`SHUTDOWN_GRACE`）和 `launch.rs`（`FIRST_PAGE_WAIT`）
