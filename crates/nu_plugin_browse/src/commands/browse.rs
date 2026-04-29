@@ -1,13 +1,11 @@
 use nu_plugin::{EngineInterface, EvaluatedCall, SimplePluginCommand};
-use nu_protocol::{
-    Category, Example, LabeledError, Record, Signature, SyntaxShape, Type, Value,
-};
+use nu_protocol::{Category, Example, LabeledError, Record, Signature, SyntaxShape, Type, Value};
 use std::error::Error;
 use std::time::Duration;
 
-use crate::commands::browse_open::{run_persistent, PersistentParams};
+use crate::commands::browse_open::{PersistentParams, run_persistent};
 use crate::launch::launch_ephemeral;
-use crate::page::page_navigate;
+use crate::page::{NavigateParams, page_navigate};
 use crate::session::has_active_session;
 use crate::utils::{ensure_url, parse_ntrace, resolve_eval_js_and_mode};
 
@@ -78,7 +76,9 @@ impl SimplePluginCommand for Browse {
     }
 
     fn search_terms(&self) -> Vec<&str> {
-        vec!["browse", "web", "scrape", "headless", "chrome", "chromium", "browser"]
+        vec![
+            "browse", "web", "scrape", "headless", "chrome", "chromium", "browser",
+        ]
     }
 
     fn examples(&'_ self) -> Vec<Example<'_>> {
@@ -157,6 +157,7 @@ impl SimplePluginCommand for Browse {
             rt.block_on(run_persistent(PersistentParams {
                 url,
                 stealth,
+                with_head,
                 wait,
                 init_script,
                 eval_js,
@@ -202,7 +203,7 @@ impl SimplePluginCommand for Browse {
                 }
 
                 let result: Result<(chaser_oxide::Browser, chaser_oxide::Page), Box<dyn Error>> =
-                    async { launch_ephemeral(with_head, &cwd).await }.await;
+                    launch_ephemeral(with_head, &cwd).await;
 
                 let (mut browser, page) = result.map_err(|e| {
                     LabeledError::new(format!("{e}")).with_label("browse failed", call.head)
@@ -212,14 +213,16 @@ impl SimplePluginCommand for Browse {
 
                 let nav_result = page_navigate(
                     &chaser,
-                    &url,
-                    stealth,
-                    wait,
-                    init_script.as_deref(),
-                    eval_js.as_deref(),
-                    real_eval,
-                    ntrace_opt,
-                    call.head,
+                    &NavigateParams {
+                        url: &url,
+                        stealth,
+                        wait,
+                        init_script: init_script.as_deref(),
+                        eval_js: eval_js.as_deref(),
+                        real_eval,
+                        ntrace: ntrace_opt,
+                        span: call.head,
+                    },
                 )
                 .await;
 

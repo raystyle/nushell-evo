@@ -26,7 +26,6 @@ let r2 = browse $TARGET --eval "document.title"
 print $"  status: ($r2.status)"
 print $"  eval: ($r2.eval)"
 assert ($r2.status == "success")
-# JSON.stringify 会加引号，trim 掉
 assert (($r2.eval | str replace -a '"' "") =~ "百度")
 
 # ─────────────────────────────────────────────────────────────────
@@ -60,7 +59,6 @@ let r6 = browse $TARGET --real-eval "1+1" --eval "2+2"
 print $"  status: ($r6.status)"
 print $"  eval: ($r6.eval)"
 assert ($r6.status == "success")
-# JSON.stringify(2) returns "2" as string, which gets JSON-stringified again
 let eval_val = ($r6.eval | str trim -c '"')
 assert ($eval_val == "2")
 
@@ -98,8 +96,6 @@ assert ($r8d.eval == "null")
 # ─────────────────────────────────────────────────────────────────
 print $"\n=== 9. --ntrace 网络追踪 ==="
 sleep 500ms
-# 用 _t 参数避免浏览器缓存
-sleep 500ms
 let r9 = browse $"($TARGET)?_t=(date now | format date '%s')" --ntrace '.*'
 print $"  status: ($r9.status)"
 assert ($r9.status == "success")
@@ -112,31 +108,27 @@ print $"  responses: ($ress | length)"
 assert (($reqs | length) > 0)
 assert (($ress | length) > 0)
 
-# request 有 headers
 let first_req = $reqs | first
 assert ($first_req.headers? != null)
 print $"  sample request headers: ($first_req.headers | str substring 0..<80)..."
 
-# response 有 headers + body
 let first_res = $ress | first
 assert ($first_res.headers? != null)
 assert ($first_res.mime? != null)
 print $"  sample response: ($first_res.url) status=($first_res.status) mime=($first_res.mime)"
 
-# response body 非空
 if ($first_res.body? != null) {
     print $"  sample body length: ($first_res.body | str length) bytes"
 }
 let bodies = ($ress | get body? | compact)
 print $"  responses with body: ($bodies | length) / ($ress | length)"
-# main document 的 body 应该包含 html
 let main_doc = $ress | where mime =~ 'html'
 assert (($main_doc | length) >= 1)
 let main_body = ($main_doc | first).body
 assert ($main_body =~ "<html")
 
 # ─────────────────────────────────────────────────────────────────
-print $"\n=== 10. --ntrace 按 MIME 过滤 ==="
+print $"\n=== 10. --ntrace 按 MIME 过滤 JS ==="
 let js_res = $r9.network | where type == response | where mime =~ 'javascript'
 print $"  JS responses: ($js_res | length)"
 if ($js_res | length) > 0 {
@@ -209,8 +201,8 @@ if ($r16.network? | is-not-empty) {
 }
 
 # ─────────────────────────────────────────────────────────────────
-print $"\n=== 17. --open 持久浏览器 ==="
-let r17 = browse $TARGET --open
+print $"\n=== 17. browse open 默认无头模式 ==="
+let r17 = browse open $TARGET
 print $"  status: ($r17.status)"
 print $"  url: ($r17.url)"
 print $"  profile: ($r17.profile)"
@@ -260,114 +252,157 @@ assert ($r22.status == "error")
 assert ($r22.message =~ "eval error")
 
 # ─────────────────────────────────────────────────────────────────
-print $"\n=== 23. browse --open 等价 browse open ==="
+print $"\n=== 23. browse open --with-head GUI 模式 ==="
 browse close
-let r23 = browse $TARGET --open
+sleep 500ms
+let r23 = browse open $TARGET --with-head
 print $"  status: ($r23.status)"
 assert ($r23.status == "opened")
 assert ($r23.url == $TARGET)
-
-# ─────────────────────────────────────────────────────────────────
-print $"\n=== 24. browse open 无参数连接已有 ==="
-let r24 = browse open
-print $"  status: ($r24.status)"
-assert ($r24.status == "opened")
-
-# ─────────────────────────────────────────────────────────────────
-print $"\n=== 25. browse close ==="
-let r25 = browse close
-print $"  status: ($r25.status)"
-assert ($r25.status == "closed")
-
-# ─────────────────────────────────────────────────────────────────
-print $"\n=== 26. 无活跃 session 时 browse close ==="
-let r26 = browse close
-print $"  status: ($r26.status)"
-assert ($r26.status == "no_session")
-
-# ─────────────────────────────────────────────────────────────────
-print $"\n=== 27. 持久浏览器活跃时 ephemeral 应拒绝 ==="
-browse $TARGET --open
-sleep 500ms
-let r27 = browse $TARGET
-print $"  status: ($r27.status)"
-assert ($r27.status == "error")
-assert ($r27.message =~ "Persistent browser is active")
+assert ($r23.session | is-not-empty)
+# GUI 模式下 eval 仍正常工作
+let r23b = browse open --eval "document.title"
+print $"  eval: ($r23b.eval)"
+assert ($r23b.status == "success")
+assert (($r23b.eval | str replace -a '"' "") =~ "百度")
 browse close
 
 # ─────────────────────────────────────────────────────────────────
-print $"\n=== 28. --no-stealth ==="
+print $"\n=== 24. browse --open --with-head 等价 browse open --with-head ==="
 sleep 500ms
-let r28 = browse $TARGET --no-stealth
+let r24 = browse $TARGET --open --with-head
+print $"  status: ($r24.status)"
+assert ($r24.status == "opened")
+assert ($r24.url == $TARGET)
+browse close
+
+# ─────────────────────────────────────────────────────────────────
+print $"\n=== 25. browse --open 等价 browse open（无头）==="
+sleep 500ms
+let r25 = browse $TARGET --open
+print $"  status: ($r25.status)"
+assert ($r25.status == "opened")
+assert ($r25.url == $TARGET)
+
+# ─────────────────────────────────────────────────────────────────
+print $"\n=== 26. browse open 无参数连接已有 ==="
+let r26 = browse open
+print $"  status: ($r26.status)"
+assert ($r26.status == "opened")
+
+# ─────────────────────────────────────────────────────────────────
+print $"\n=== 27. browse close ==="
+let r27 = browse close
+print $"  status: ($r27.status)"
+assert ($r27.status == "closed")
+
+# ─────────────────────────────────────────────────────────────────
+print $"\n=== 28. 无活跃 session 时 browse close ==="
+let r28 = browse close
 print $"  status: ($r28.status)"
-assert ($r28.status == "success")
-assert (($r28.content | str length) > 1000)
+assert ($r28.status == "no_session")
 
 # ─────────────────────────────────────────────────────────────────
-print $"\n=== 29. --wait ==="
+print $"\n=== 29. 持久浏览器活跃时 ephemeral 应拒绝 ==="
+browse $TARGET --open
 sleep 500ms
-let r29 = browse $TARGET --wait 1sec
+let r29 = browse $TARGET
 print $"  status: ($r29.status)"
-assert ($r29.status == "success")
+assert ($r29.status == "error")
+assert ($r29.message =~ "Persistent browser is active")
+browse close
 
 # ─────────────────────────────────────────────────────────────────
-print $"\n=== 30. --init-script 页面脚本前注入 ==="
+print $"\n=== 30. --no-stealth ==="
+sleep 500ms
+let r30 = browse $TARGET --no-stealth
+print $"  status: ($r30.status)"
+assert ($r30.status == "success")
+assert (($r30.content | str length) > 1000)
+
+# ─────────────────────────────────────────────────────────────────
+print $"\n=== 31. --wait ==="
+sleep 500ms
+let r31 = browse $TARGET --wait 1sec
+print $"  status: ($r31.status)"
+assert ($r31.status == "success")
+
+# ─────────────────────────────────────────────────────────────────
+print $"\n=== 32. --init-script 页面脚本前注入 ==="
 sleep 500ms
 let hook_path = $"($env.TEMP)/nu_browse_test_hook.js"
 "window.__NU_BROWSE_INIT_TEST = 'injected';" | save -f $hook_path
-let r30 = browse $TARGET --init-script $hook_path --real-eval "window.__NU_BROWSE_INIT_TEST"
-print $"  status: ($r30.status)"
-print $"  eval: ($r30.eval)"
-assert ($r30.status == "success")
-assert ($r30.eval =~ "injected")
+let r32 = browse $TARGET --init-script $hook_path --real-eval "window.__NU_BROWSE_INIT_TEST"
+print $"  status: ($r32.status)"
+print $"  eval: ($r32.eval)"
+assert ($r32.status == "success")
+assert ($r32.eval =~ "injected")
 rm -f $hook_path
 
 # ─────────────────────────────────────────────────────────────────
-print $"\n=== 31. --init-script 运行时错误捕获 ==="
+print $"\n=== 33. --init-script 运行时错误捕获 ==="
 sleep 500ms
 let bad_hook = $"($env.TEMP)/nu_browse_test_runtime_err.js"
 "undefinedVar.test;" | save -f $bad_hook
 sleep 500ms
-let r31 = browse $TARGET --init-script $bad_hook --real-eval "1+1"
-print $"  status: ($r31.status)"
-print $"  init_errors: ($r31.init_errors?)"
-assert ($r31.status == "success")
-assert ($r31.init_errors? | is-not-empty)
-assert (($r31.init_errors | first) =~ "ReferenceError")
+let r33 = browse $TARGET --init-script $bad_hook --real-eval "1+1"
+print $"  status: ($r33.status)"
+print $"  init_errors: ($r33.init_errors?)"
+assert ($r33.status == "success")
+assert ($r33.init_errors? | is-not-empty)
+assert (($r33.init_errors | first) =~ "ReferenceError")
 rm -f $bad_hook
 
 # ─────────────────────────────────────────────────────────────────
-print $"\n=== 32. --init-script 语法错误捕获 ==="
+print $"\n=== 34. --init-script 语法错误捕获 ==="
 sleep 500ms
 let bad_hook2 = $"($env.TEMP)/nu_browse_test_syntax_err.js"
 "function( {" | save -f $bad_hook2
 sleep 500ms
-let r32 = browse $TARGET --init-script $bad_hook2 --real-eval "1+1"
-print $"  status: ($r32.status)"
-print $"  init_errors: ($r32.init_errors?)"
-assert ($r32.status == "success")
-assert ($r32.init_errors? | is-not-empty)
-assert (($r32.init_errors | first) =~ "SyntaxError")
+let r34 = browse $TARGET --init-script $bad_hook2 --real-eval "1+1"
+print $"  status: ($r34.status)"
+print $"  init_errors: ($r34.init_errors?)"
+assert ($r34.status == "success")
+assert ($r34.init_errors? | is-not-empty)
+assert (($r34.init_errors | first) =~ "SyntaxError")
 rm -f $bad_hook2
 
 # ─────────────────────────────────────────────────────────────────
-print $"\n=== 33. ephemeral 无 URL 应报错 ==="
+print $"\n=== 35. ephemeral 无 URL 应报错 ==="
 sleep 500ms
-let r30 = browse
-print $"  status: ($r30.status)"
-assert ($r30.status == "error")
+let r35 = browse
+print $"  status: ($r35.status)"
+assert ($r35.status == "error")
 
 # ─────────────────────────────────────────────────────────────────
-print $"\n=== 34. 不规范 URL 应报错 ==="
+print $"\n=== 36. 不规范 URL 应报错 ==="
 sleep 500ms
-let r34 = browse baidu.com
-print $"  status: ($r34.status)"
-assert ($r34.status == "error")
-assert ($r34.message =~ "invalid URL")
-assert ($r34.message =~ "http://")
+let r36 = browse baidu.com
+print $"  status: ($r36.status)"
+assert ($r36.status == "error")
+assert ($r36.message =~ "invalid URL")
+assert ($r36.message =~ "http://")
+
+# ─────────────────────────────────────────────────────────────────
+print $"\n=== 37. browse open --with-head --eval 组合 ==="
+let r37 = browse open $TARGET --with-head --eval "document.title"
+print $"  status: ($r37.status)"
+print $"  eval: ($r37.eval)"
+assert ($r37.status == "opened")
+assert (($r37.eval | str replace -a '"' "") =~ "百度")
+browse close
+
+# ─────────────────────────────────────────────────────────────────
+print $"\n=== 38. browse open --no-stealth ==="
+let r38 = browse open $TARGET --no-stealth
+print $"  status: ($r38.status)"
+assert ($r38.status == "opened")
+let r38b = browse open --eval "1+1"
+assert ($r38b.status == "success")
+browse close
 
 # ─────────────────────────────────────────────────────────────────
 # 清理
 try { browse close } catch { }
 
-print $"\n=== 所有 34 项测试通过 ==="
+print $"\n=== 所有 38 项测试通过 ==="

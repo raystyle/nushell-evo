@@ -5,13 +5,14 @@ use nu_protocol::{
     Category, Example, LabeledError, Record, Signature, Span, SyntaxShape, Type, Value,
 };
 use regex::Regex;
+use std::mem::ManuallyDrop;
 use std::time::Duration;
 
 use crate::launch::launch_persistent;
-use crate::page::{page_eval_only, page_navigate};
+use crate::page::{NavigateParams, page_eval_only, page_navigate};
 use crate::session::{
-    has_active_session, load_ws_url, profile_dir, session_file, try_close_existing,
-    DEFAULT_DEBUG_PORT,
+    DEFAULT_DEBUG_PORT, has_active_session, load_ws_url, profile_dir, session_file,
+    try_close_existing,
 };
 use crate::utils::{ensure_url, parse_ntrace, resolve_eval_js_and_mode};
 
@@ -19,6 +20,7 @@ use crate::utils::{ensure_url, parse_ntrace, resolve_eval_js_and_mode};
 pub struct PersistentParams {
     pub url: Option<String>,
     pub stealth: bool,
+    pub with_head: bool,
     pub wait: Option<Duration>,
     pub init_script: Option<String>,
     pub eval_js: Option<String>,
@@ -33,6 +35,7 @@ pub async fn run_persistent(params: PersistentParams) -> Result<Value, LabeledEr
     let PersistentParams {
         url,
         stealth,
+        with_head,
         wait,
         init_script,
         eval_js,
@@ -59,21 +62,23 @@ pub async fn run_persistent(params: PersistentParams) -> Result<Value, LabeledEr
             }
             try_close_existing(&cwd).await;
 
-            let (browser, page) = launch_persistent(&cwd).await.map_err(|e| {
+            let (browser, page) = launch_persistent(with_head, &cwd).await.map_err(|e| {
                 LabeledError::new(format!("{e}")).with_label("browse open failed", span)
             })?;
 
             let chaser = ChaserPage::new(page);
             let nav_result = page_navigate(
                 &chaser,
-                &url,
-                stealth,
-                wait,
-                init_script.as_deref(),
-                eval_js.as_deref(),
-                real_eval,
-                ntrace_opt,
-                span,
+                &NavigateParams {
+                    url: &url,
+                    stealth,
+                    wait,
+                    init_script: init_script.as_deref(),
+                    eval_js: eval_js.as_deref(),
+                    real_eval,
+                    ntrace: ntrace_opt,
+                    span,
+                },
             )
             .await;
 
@@ -87,9 +92,7 @@ pub async fn run_persistent(params: PersistentParams) -> Result<Value, LabeledEr
                         record.push("message", Value::string(err_msg, span));
                         return Ok(Value::record(record, span));
                     }
-                    return Err(
-                        LabeledError::new(err_msg).with_label("browse open failed", span)
-                    );
+                    return Err(LabeledError::new(err_msg).with_label("browse open failed", span));
                 }
             };
 
@@ -112,13 +115,16 @@ pub async fn run_persistent(params: PersistentParams) -> Result<Value, LabeledEr
                 record.push(
                     "init_errors",
                     Value::list(
-                        init_errors.into_iter().map(|e| Value::string(e, span)).collect(),
+                        init_errors
+                            .into_iter()
+                            .map(|e| Value::string(e, span))
+                            .collect(),
                         span,
                     ),
                 );
             }
 
-            std::mem::forget(browser);
+            let _browser = ManuallyDrop::new(browser);
         }
         (None, Some(js)) => {
             if !has_active_session(&cwd) {
@@ -143,7 +149,7 @@ pub async fn run_persistent(params: PersistentParams) -> Result<Value, LabeledEr
             let _h = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
             let _ = browser.fetch_targets().await;
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await; // allow targets to register
 
             let page = {
                 let all_pages = browser.pages().await.unwrap_or_default();
@@ -205,7 +211,7 @@ pub async fn run_persistent(params: PersistentParams) -> Result<Value, LabeledEr
                 }
             }
 
-            std::mem::forget(browser);
+            let _browser = ManuallyDrop::new(browser);
         }
         (None, None) => {
             if has_active_session(&cwd) {
@@ -213,13 +219,13 @@ pub async fn run_persistent(params: PersistentParams) -> Result<Value, LabeledEr
                 record.push("url", Value::string("", span));
                 record.push("profile", Value::string(&profile_path, span));
             } else {
-                let (browser, _page) = launch_persistent(&cwd).await.map_err(|e| {
+                let (browser, _page) = launch_persistent(with_head, &cwd).await.map_err(|e| {
                     LabeledError::new(format!("{e}")).with_label("browse open failed", span)
                 })?;
                 record.push("status", Value::string("opened", span));
                 record.push("url", Value::string("", span));
                 record.push("profile", Value::string(&profile_path, span));
-                std::mem::forget(browser);
+                let _browser = ManuallyDrop::new(browser);
             }
         }
     }
@@ -245,6 +251,7 @@ impl SimplePluginCommand for BrowseOpen {
         Signature::build("browse open")
             .optional("url", SyntaxShape::String, "URL to navigate to (optional)")
             .switch("no-stealth", "Disable stealth mode", None)
+            .switch("with-head", "Show browser window", None)
             .named(
                 "init-script",
                 SyntaxShape::Filepath,
@@ -294,7 +301,14 @@ impl SimplePluginCommand for BrowseOpen {
     }
 
     fn search_terms(&self) -> Vec<&str> {
-        vec!["browse", "open", "browser", "persistent", "chrome", "chromium"]
+        vec![
+            "browse",
+            "open",
+            "browser",
+            "persistent",
+            "chrome",
+            "chromium",
+        ]
     }
 
     fn examples(&'_ self) -> Vec<Example<'_>> {
@@ -331,6 +345,7 @@ impl SimplePluginCommand for BrowseOpen {
     ) -> Result<Value, LabeledError> {
         let url: Option<String> = call.opt(0)?;
         let stealth = !call.has_flag("no-stealth")?;
+        let with_head = call.has_flag("with-head")?;
         let wait = call.get_flag::<Duration>("wait")?;
         let init_script: Option<String> = call.get_flag("init-script")?;
 
@@ -353,6 +368,7 @@ impl SimplePluginCommand for BrowseOpen {
         rt.block_on(run_persistent(PersistentParams {
             url,
             stealth,
+            with_head,
             wait,
             init_script,
             eval_js,

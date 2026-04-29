@@ -33,7 +33,7 @@ AGENTS.md
 - 命令：
   - `browse <url>` — 一次性获取页面 HTML（ephemeral 浏览器，自动关闭）
   - `browse <url> --open` — 等价于 `browse open <url>`，打开持久浏览器
-  - `browse open [url]` — 打开/连接持久浏览器（显示窗口），跨调用复用 cookie/localStorage
+  - `browse open [url]` — 打开/连接持久浏览器（默认无头，`--with-head` 显示窗口），跨调用复用 cookie/localStorage
   - `browse close` — 关闭持久浏览器
 - 参数：`--init-script <path>`（页面脚本前注入 JS）、`--eval <js>` / `-e`（隔离世界执行 JS，支持管道输入）、`--real-eval <js>`（主世界执行 JS）、`--no-stealth`、`--with-head`、`-w <duration>`、`--ntrace <pattern>`（网络追踪，默认含完整 headers 和 response body）
 - Session 管理：`.nu_browse_profile/` 目录存储 Chrome profile 和 `.session` 文件，单 session 覆盖模式（`browse open` 自动回收旧 session）

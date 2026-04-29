@@ -3,7 +3,9 @@ use futures::StreamExt;
 use std::error::Error;
 use std::time::Duration;
 
-use crate::session::{DEFAULT_DEBUG_PORT, profile_dir, ensure_profile_dir, save_session};
+use crate::session::{DEFAULT_DEBUG_PORT, ensure_profile_dir, profile_dir, save_session};
+
+const FIRST_PAGE_WAIT: Duration = Duration::from_millis(500);
 
 pub fn viewport_config(with_head: bool) -> Option<Viewport> {
     if with_head {
@@ -20,20 +22,27 @@ pub fn viewport_config(with_head: bool) -> Option<Viewport> {
     }
 }
 
-pub async fn launch_persistent(cwd: &str) -> Result<(Browser, Page), Box<dyn Error>> {
+pub async fn launch_persistent(
+    with_head: bool,
+    cwd: &str,
+) -> Result<(Browser, Page), Box<dyn Error>> {
     let dir = profile_dir(cwd);
     std::fs::create_dir_all(&dir)?;
 
-    let config = BrowserConfig::builder()
-        .port(DEFAULT_DEBUG_PORT as u16)
+    let mut config = BrowserConfig::builder()
+        .port(DEFAULT_DEBUG_PORT)
         .user_data_dir(&dir)
         .window_size(1920, 1080)
-        .viewport(None)
-        .with_head()
-        .arg("--test-type")
-        .build()?;
+        .viewport(viewport_config(with_head))
+        .arg("--test-type");
 
-    let (mut browser, mut handler) = Browser::launch(config).await?;
+    if with_head {
+        config = config.with_head();
+    } else {
+        config = config.new_headless_mode();
+    }
+
+    let (mut browser, mut handler) = Browser::launch(config.build()?).await?;
 
     let ws_url = format!("http://localhost:{}/json/version", DEFAULT_DEBUG_PORT);
     save_session(cwd, &ws_url)?;
@@ -44,7 +53,10 @@ pub async fn launch_persistent(cwd: &str) -> Result<(Browser, Page), Box<dyn Err
     Ok((browser, page))
 }
 
-pub async fn launch_ephemeral(with_head: bool, cwd: &str) -> Result<(Browser, Page), Box<dyn Error>> {
+pub async fn launch_ephemeral(
+    with_head: bool,
+    cwd: &str,
+) -> Result<(Browser, Page), Box<dyn Error>> {
     let dir = ensure_profile_dir(cwd);
 
     let mut config = BrowserConfig::builder()
@@ -68,7 +80,7 @@ pub async fn launch_ephemeral(with_head: bool, cwd: &str) -> Result<(Browser, Pa
 }
 
 pub async fn first_page(browser: &mut Browser) -> Result<Page, Box<dyn Error>> {
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(FIRST_PAGE_WAIT).await;
     match browser.pages().await {
         Ok(pages) if !pages.is_empty() => {
             let mut pages = pages.into_iter();

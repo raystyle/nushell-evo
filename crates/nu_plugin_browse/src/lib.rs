@@ -6,8 +6,9 @@ mod page;
 mod session;
 mod utils;
 
-pub use commands::{Browse, BrowseClose, BrowseOpen};
+pub use commands::{Browse, BrowseClose, BrowseOpen, BrowseStatus};
 
+#[derive(Debug)]
 pub struct BrowsePlugin;
 
 impl Plugin for BrowsePlugin {
@@ -19,6 +20,7 @@ impl Plugin for BrowsePlugin {
         vec![
             Box::new(Browse),
             Box::new(BrowseOpen),
+            Box::new(BrowseStatus),
             Box::new(BrowseClose),
         ]
     }

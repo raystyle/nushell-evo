@@ -3,7 +3,7 @@ use futures::StreamExt;
 use std::path::PathBuf;
 use std::time::Duration;
 
-pub const DEFAULT_DEBUG_PORT: u32 = 9223;
+pub const DEFAULT_DEBUG_PORT: u16 = 9223;
 pub const PROFILE_DIR: &str = ".nu_browse_profile";
 pub const SESSION_FILE: &str = ".session";
 
@@ -21,6 +21,8 @@ pub fn session_file(cwd: &str) -> PathBuf {
     profile_dir(cwd).join(SESSION_FILE)
 }
 
+/// Optimistic check — a stale file may remain if Chrome crashed.
+/// The actual connection is validated when `try_close_existing` or `Browser::connect` runs.
 pub fn has_active_session(cwd: &str) -> bool {
     session_file(cwd).exists()
 }

@@ -2,7 +2,10 @@ use nu_plugin::EvaluatedCall;
 use nu_protocol::Value;
 use regex::Regex;
 
-pub const EVAL_ERROR_PREFIX: &str = "__NU_EVAL_ERROR:";
+#[cfg(test)]
+use nu_protocol::Span;
+
+pub const EVAL_ERROR_PREFIX: &str = "__NU_EVAL_ERROR__INTERNAL__:";
 
 pub fn resolve_eval_js_and_mode(call: &EvaluatedCall, input: &Value) -> Option<(String, bool)> {
     if let Some(js) = call.get_flag::<String>("real-eval").ok().flatten() {
@@ -57,7 +60,9 @@ pub fn ensure_url(url: &str) -> Result<String, String> {
     if url.starts_with("http://") || url.starts_with("https://") {
         Ok(url.to_string())
     } else {
-        Err(format!("invalid URL '{url}': must start with http:// or https://"))
+        Err(format!(
+            "invalid URL '{url}': must start with http:// or https://"
+        ))
     }
 }
 
@@ -67,12 +72,18 @@ mod tests {
 
     #[test]
     fn test_ensure_url_accepts_http() {
-        assert_eq!(ensure_url("http://example.com").unwrap(), "http://example.com");
+        assert_eq!(
+            ensure_url("http://example.com").unwrap(),
+            "http://example.com"
+        );
     }
 
     #[test]
     fn test_ensure_url_accepts_https() {
-        assert_eq!(ensure_url("https://example.com").unwrap(), "https://example.com");
+        assert_eq!(
+            ensure_url("https://example.com").unwrap(),
+            "https://example.com"
+        );
     }
 
     #[test]
@@ -92,9 +103,20 @@ mod tests {
 
     #[test]
     fn test_check_eval_result_error() {
-        let result = check_eval_result("__NU_EVAL_ERROR:TypeError: x is not a function");
+        let result =
+            check_eval_result("__NU_EVAL_ERROR__INTERNAL__:TypeError: x is not a function");
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "TypeError: x is not a function");
+    }
+
+    #[test]
+    fn test_check_eval_result_no_false_positive() {
+        // A value that starts with the old prefix should NOT match the new one
+        let result = check_eval_result("__NU_EVAL_ERROR:something");
+        assert!(
+            result.is_ok(),
+            "old prefix should not trigger false positive"
+        );
     }
 
     #[test]
@@ -138,5 +160,11 @@ mod tests {
         assert!(show_res);
         assert!(regex.is_some());
         assert!(regex.unwrap().is_match("https://example.com/path"));
+    }
+
+    #[test]
+    fn test_resolve_eval_nothing_input_returns_none() {
+        let call = EvaluatedCall::new(Span::test_data());
+        assert!(resolve_eval_js_and_mode(&call, &Value::nothing(Span::test_data())).is_none());
     }
 }
