@@ -145,7 +145,7 @@ mockito = { version = "1.7.2", default-features = false }
 multipart-rs = "0.1.13"
 native-tls = "0.2.18"
 nix = { version = "0.31.2", default-features = false }
-notify-debouncer-full = { version = "0.3", default-features = false }
+notify-debouncer-full = { version = "0.7", default-features = false }
 nu-ansi-term = "0.50.3"
 nucleo-matcher = "0.3"
 num-format = "0.4"
